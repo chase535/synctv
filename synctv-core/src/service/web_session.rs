@@ -29,7 +29,7 @@ const MAX_WEB_SESSION_LABEL_BYTES: usize = 128;
 const WEB_PLAYBACK_LOCK_TTL: Duration = Duration::from_secs(45);
 const WEB_PLAYBACK_WAIT_STEP: Duration = Duration::from_millis(100);
 const WEB_PLAYBACK_WAIT_STEPS: usize = 300;
-const MAX_WEB_PLAYBACK_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const MAX_WEB_PLAYBACK_CACHE_TTL: Duration = Duration::from_hours(6);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -414,7 +414,7 @@ impl WebSessionPlaybackCoordinator {
         format!("lock:{cache_key}")
     }
 
-    fn store_error(operation: &str, error: StoreError) -> Error {
+    fn store_error(operation: &str, error: &StoreError) -> Error {
         Error::Internal(format!(
             "provider room playback {operation} failed: {error}"
         ))
@@ -424,7 +424,7 @@ impl WebSessionPlaybackCoordinator {
         self.store
             .get(key)
             .await
-            .map_err(|error| Self::store_error("cache read", error))
+            .map_err(|error| Self::store_error("cache read", &error))
     }
 
     async fn wait_for_cached<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
@@ -528,7 +528,7 @@ impl WebSessionPlaybackCoordinator {
                     self.store
                         .set(&cache_key, &resolved.value, cache_ttl)
                         .await
-                        .map_err(|error| Self::store_error("cache write", error))?;
+                        .map_err(|error| Self::store_error("cache write", &error))?;
                     return Ok(resolved.value);
                 }
                 Err(StoreError::LockFailed(_)) => {
@@ -537,7 +537,7 @@ impl WebSessionPlaybackCoordinator {
                         return Ok(value);
                     }
                 }
-                Err(error) => return Err(Self::store_error("lock acquisition", error)),
+                Err(error) => return Err(Self::store_error("lock acquisition", &error)),
             }
         }
 
