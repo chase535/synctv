@@ -67,6 +67,12 @@ fn source_provider_to_proto(provider: synctv_core::models::SourceProvider) -> i3
         synctv_core::models::SourceProvider::Youtube => {
             source_config_proto::SourceProvider::Youtube as i32
         }
+        synctv_core::models::SourceProvider::Iqiyi => {
+            source_config_proto::SourceProvider::Iqiyi as i32
+        }
+        synctv_core::models::SourceProvider::TencentVideo => {
+            source_config_proto::SourceProvider::TencentVideo as i32
+        }
     }
 }
 
@@ -923,6 +929,20 @@ fn media_source_config_to_proto(
                 path: config.path,
             })
         }
+        synctv_core::models::MediaSourceConfig::Iqiyi(config) => {
+            Provider::Iqiyi(source_config_proto::IqiyiMediaSourceConfig {
+                url: config.url,
+                shared: config.shared,
+                proxy_mode: playback_proxy_mode_to_proto(config.proxy_mode),
+            })
+        }
+        synctv_core::models::MediaSourceConfig::TencentVideo(config) => {
+            Provider::TencentVideo(source_config_proto::TencentVideoMediaSourceConfig {
+                url: config.url,
+                shared: config.shared,
+                proxy_mode: playback_proxy_mode_to_proto(config.proxy_mode),
+            })
+        }
     };
 
     source_config_proto::MediaSourceConfig {
@@ -1034,6 +1054,8 @@ fn media_resource_metadata_to_proto(
         synctv_core::models::MediaSourceConfig::Nextcloud(config) => config.path.clone(),
         synctv_core::models::MediaSourceConfig::Seafile(config) => config.path.clone(),
         synctv_core::models::MediaSourceConfig::TrueNas(config) => config.path.clone(),
+        synctv_core::models::MediaSourceConfig::Iqiyi(config) => config.url.clone(),
+        synctv_core::models::MediaSourceConfig::TencentVideo(config) => config.url.clone(),
     };
 
     client_proto::ResourceMetadata {
