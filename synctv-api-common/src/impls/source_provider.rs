@@ -31,6 +31,8 @@ pub fn proto_source_provider_required(value: i32) -> Result<SourceProvider, ApiE
         source_config_proto::SourceProvider::Seafile => Ok(SourceProvider::Seafile),
         source_config_proto::SourceProvider::Truenas => Ok(SourceProvider::TrueNas),
         source_config_proto::SourceProvider::Youtube => Ok(SourceProvider::Youtube),
+        source_config_proto::SourceProvider::Iqiyi => Ok(SourceProvider::Iqiyi),
+        source_config_proto::SourceProvider::TencentVideo => Ok(SourceProvider::TencentVideo),
     }
 }
 
@@ -72,6 +74,8 @@ pub const fn core_source_provider_to_proto(provider: SourceProvider) -> i32 {
         SourceProvider::TrueNas => source_config_proto::SourceProvider::Truenas as i32,
         SourceProvider::Youtube => source_config_proto::SourceProvider::Youtube as i32,
         SourceProvider::TikTok => source_config_proto::SourceProvider::Tiktok as i32,
+        SourceProvider::Iqiyi => source_config_proto::SourceProvider::Iqiyi as i32,
+        SourceProvider::TencentVideo => source_config_proto::SourceProvider::TencentVideo as i32,
     }
 }
 
@@ -171,6 +175,14 @@ mod tests {
         (
             SourceProvider::Youtube,
             source_config_proto::SourceProvider::Youtube,
+        ),
+        (
+            SourceProvider::Iqiyi,
+            source_config_proto::SourceProvider::Iqiyi,
+        ),
+        (
+            SourceProvider::TencentVideo,
+            source_config_proto::SourceProvider::TencentVideo,
         ),
     ];
 
