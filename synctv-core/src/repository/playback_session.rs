@@ -4,13 +4,14 @@ use sqlx::PgPool;
 use crate::models::{
     EmbyPlaybackSession, FnosPlaybackSession, ProviderPlaybackSession,
     ProviderPlaybackSessionRecord, ProviderPlaybackSessionState, ProviderPlaybackStopReason,
-    RoomId, SynologyPlaybackSession, UserId,
+    RoomId, SynologyPlaybackSession, UserId, WebSessionPlaybackSession,
 };
 use crate::{Error, Result};
 
 const ACTIVE_LEASE_SECONDS: i64 = 45;
 const PAUSED_LEASE_SECONDS: i64 = 10 * 60;
 const CLEANUP_CLAIM_SECONDS: f64 = 30.0;
+const MAX_CREDENTIAL_REVISION_BYTES: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct NewProviderPlaybackSession {
@@ -64,6 +65,20 @@ impl ProviderPlaybackSessionRepository {
             return Err(Error::InvalidInput(
                 "provider playback server_id exceeds 64 bytes".to_string(),
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_web_session(session: &WebSessionPlaybackSession) -> Result<()> {
+        Self::validate_server_id(&session.server_id)?;
+        Self::validate_required(
+            &session.credential_revision,
+            "web-session credential revision",
+        )?;
+        if session.credential_revision.len() > MAX_CREDENTIAL_REVISION_BYTES {
+            return Err(Error::InvalidInput(format!(
+                "provider playback web-session credential revision exceeds {MAX_CREDENTIAL_REVISION_BYTES} bytes"
+            )));
         }
         Ok(())
     }
@@ -141,6 +156,8 @@ impl ProviderPlaybackSessionRepository {
                 }
                 Ok(())
             }
+            ProviderPlaybackSession::Iqiyi(session)
+            | ProviderPlaybackSession::TencentVideo(session) => Self::validate_web_session(session),
         }
     }
 
@@ -467,5 +484,52 @@ impl ProviderPlaybackSessionRepository {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_iqiyi_web_session_identity() {
+        let session = ProviderPlaybackSession::Iqiyi(WebSessionPlaybackSession {
+            server_id: "web-session".to_string(),
+            credential_revision: "0123456789abcdef".to_string(),
+        });
+
+        ProviderPlaybackSessionRepository::validate_session(&session)
+            .expect("valid iQiyi room session should pass validation");
+    }
+
+    #[test]
+    fn accepts_tencent_web_session_identity() {
+        let session = ProviderPlaybackSession::TencentVideo(WebSessionPlaybackSession {
+            server_id: "web-session".to_string(),
+            credential_revision: "fedcba9876543210".to_string(),
+        });
+
+        ProviderPlaybackSessionRepository::validate_session(&session)
+            .expect("valid Tencent Video room session should pass validation");
+    }
+
+    #[test]
+    fn rejects_empty_web_session_revision() {
+        let session = ProviderPlaybackSession::Iqiyi(WebSessionPlaybackSession {
+            server_id: "web-session".to_string(),
+            credential_revision: " ".to_string(),
+        });
+
+        assert!(ProviderPlaybackSessionRepository::validate_session(&session).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_web_session_revision() {
+        let session = ProviderPlaybackSession::TencentVideo(WebSessionPlaybackSession {
+            server_id: "web-session".to_string(),
+            credential_revision: "x".repeat(MAX_CREDENTIAL_REVISION_BYTES + 1),
+        });
+
+        assert!(ProviderPlaybackSessionRepository::validate_session(&session).is_err());
     }
 }
