@@ -20,6 +20,8 @@ jobs:
         with:
           ref: refactor/room-provider-session
           fetch-depth: 0
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler nasm libclang-dev
       - name: Patch provider WebSession HTTP adapter
         run: python3 tool/feature_web_session_http_patch.py
       - name: Format and compile HTTP API
