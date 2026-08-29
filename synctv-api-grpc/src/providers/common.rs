@@ -4,24 +4,34 @@ use tonic::{Request, Response, Status};
 use crate::grpc::map_api_error;
 use synctv_api_common::api_runtime::SharedApiRuntime;
 use synctv_api_common::impls::admin::RequestContext;
+use synctv_api_common::impls::{validate_proto_request, ApiError, EndpointRateLimitCategory};
+use synctv_core::models::provider_instance::ProviderWebSessionCookie;
+use synctv_core::service::{
+    BindWebSessionRequest as CoreBindWebSessionRequest,
+    WebSessionBinding as CoreWebSessionBinding, WebSessionCredentialService, WebSessionProvider,
+};
+use synctv_proto::source_config::SourceProvider as ProtoSourceProvider;
 
 use synctv_proto::providers::common::provider_common_service_server::ProviderCommonService;
 use synctv_proto::providers::common::{
-    AddProviderInstanceRequest, AddProviderInstanceResponse, DeleteProviderInstanceRequest,
-    DeleteProviderInstanceResponse, DisableProviderInstanceRequest,
-    DisableProviderInstanceResponse, EnableProviderInstanceRequest, EnableProviderInstanceResponse,
-    ListAvailableProviderInstancesRequest, ListProviderBackendsRequest,
-    ListProviderInstancesRequest, ListProviderInstancesResponse, PlaybackProxyPolicy,
-    PrepareDirectUrlRequest, PrepareLiveProxyRequest, PrepareRtmpRequest, PreparedMediaSource,
-    ProviderBackendsResponse, ProviderInstancesResponse, ReconnectProviderInstanceRequest,
-    ReconnectProviderInstanceResponse, ResolvePlaybackProxyPolicyRequest,
+    AddProviderInstanceRequest, AddProviderInstanceResponse, BindWebSessionRequest,
+    BindWebSessionResponse, DeleteProviderInstanceRequest, DeleteProviderInstanceResponse,
+    DisableProviderInstanceRequest, DisableProviderInstanceResponse, EnableProviderInstanceRequest,
+    EnableProviderInstanceResponse, ListAvailableProviderInstancesRequest,
+    ListProviderBackendsRequest, ListProviderInstancesRequest, ListProviderInstancesResponse,
+    ListWebSessionsRequest, ListWebSessionsResponse, PlaybackProxyPolicy, PrepareDirectUrlRequest,
+    PrepareLiveProxyRequest, PrepareRtmpRequest, PreparedMediaSource, ProviderBackendsResponse,
+    ProviderInstancesResponse, ReconnectProviderInstanceRequest, ReconnectProviderInstanceResponse,
+    ResolvePlaybackProxyPolicyRequest, UnbindWebSessionRequest, UnbindWebSessionResponse,
     UpdateProviderInstanceRequest, UpdateProviderInstanceResponse,
+    WebSessionBinding as ProtoWebSessionBinding,
 };
 
 #[derive(Clone)]
 pub struct ProviderCommonGrpcService {
     api: Arc<synctv_api_common::providers::ProviderCommonApiImpl>,
     runtime_settings: Arc<synctv_api_common::ApiRuntimeSettings>,
+    web_session_service: Arc<WebSessionCredentialService>,
 }
 
 impl ProviderCommonGrpcService {
@@ -33,6 +43,13 @@ impl ProviderCommonGrpcService {
         Self {
             api: shared_api_runtime.provider_common_api.clone(),
             runtime_settings,
+            web_session_service: Arc::new(WebSessionCredentialService::new(
+                shared_api_runtime
+                    .playback_transport_services
+                    .credential_repo
+                    .clone(),
+                reqwest::Client::new(),
+            )),
         }
     }
 
@@ -50,6 +67,43 @@ impl ProviderCommonGrpcService {
     }
 }
 
+fn web_session_provider_from_proto(provider: i32) -> Result<WebSessionProvider, ApiError> {
+    let provider = ProtoSourceProvider::try_from(provider)
+        .map_err(|_| ApiError::InvalidInput("Unsupported source_provider".to_string()))?;
+    match provider {
+        ProtoSourceProvider::Iqiyi => Ok(WebSessionProvider::Iqiyi),
+        ProtoSourceProvider::TencentVideo => Ok(WebSessionProvider::TencentVideo),
+        _ => Err(ApiError::InvalidInput(
+            "web-session provider must be iQiyi or Tencent Video".to_string(),
+        )),
+    }
+}
+
+const fn web_session_provider_to_proto(provider: WebSessionProvider) -> i32 {
+    match provider {
+        WebSessionProvider::Iqiyi => ProtoSourceProvider::Iqiyi as i32,
+        WebSessionProvider::TencentVideo => ProtoSourceProvider::TencentVideo as i32,
+    }
+}
+
+fn web_session_binding_to_proto(
+    binding: CoreWebSessionBinding,
+) -> Result<ProtoWebSessionBinding, ApiError> {
+    let cookie_count = u32::try_from(binding.cookie_count).map_err(|_| {
+        ApiError::Internal("provider web-session cookie count exceeds u32::MAX".to_string())
+    })?;
+    Ok(ProtoWebSessionBinding {
+        credential_id: binding.credential_id,
+        provider: web_session_provider_to_proto(binding.provider),
+        server_id: binding.server_id,
+        label: binding.label,
+        cookie_count,
+        expires_at: binding.expires_at.map(|value| value.timestamp()),
+        created_at: binding.created_at.timestamp(),
+        updated_at: binding.updated_at.timestamp(),
+    })
+}
+
 #[tonic::async_trait]
 impl ProviderCommonService for ProviderCommonGrpcService {
     async fn prepare_direct_url(
@@ -63,7 +117,7 @@ impl ProviderCommonService for ProviderCommonGrpcService {
         executor_api
             .execute_user_endpoint(
                 &metadata,
-                synctv_api_common::impls::EndpointRateLimitCategory::Read,
+                EndpointRateLimitCategory::Read,
                 move |_| async move { api.prepare_direct_url(req) },
             )
             .await
@@ -82,7 +136,7 @@ impl ProviderCommonService for ProviderCommonGrpcService {
         executor_api
             .execute_user_endpoint(
                 &metadata,
-                synctv_api_common::impls::EndpointRateLimitCategory::Read,
+                EndpointRateLimitCategory::Read,
                 move |_| async move { api.prepare_live_proxy(req).await },
             )
             .await
@@ -101,7 +155,7 @@ impl ProviderCommonService for ProviderCommonGrpcService {
         executor_api
             .execute_user_endpoint(
                 &metadata,
-                synctv_api_common::impls::EndpointRateLimitCategory::Read,
+                EndpointRateLimitCategory::Read,
                 move |_| async move { api.prepare_rtmp(req) },
             )
             .await
@@ -120,7 +174,7 @@ impl ProviderCommonService for ProviderCommonGrpcService {
         executor_api
             .execute_user_endpoint(
                 &metadata,
-                synctv_api_common::impls::EndpointRateLimitCategory::Read,
+                EndpointRateLimitCategory::Read,
                 move |_| async move { api.resolve_playback_proxy_policy(req).await },
             )
             .await
@@ -140,7 +194,7 @@ impl ProviderCommonService for ProviderCommonGrpcService {
         executor_api
             .execute_user_endpoint(
                 &metadata,
-                synctv_api_common::impls::EndpointRateLimitCategory::Read,
+                EndpointRateLimitCategory::Read,
                 move |_| async move { api.list_available_provider_instances(req).await },
             )
             .await
@@ -160,9 +214,116 @@ impl ProviderCommonService for ProviderCommonGrpcService {
         executor_api
             .execute_user_endpoint(
                 &metadata,
-                synctv_api_common::impls::EndpointRateLimitCategory::Read,
+                EndpointRateLimitCategory::Read,
                 move |_| async move { api.list_provider_backends(req).await },
             )
+            .await
+            .map(Response::new)
+            .map_err(map_api_error)
+    }
+
+    async fn bind_web_session(
+        &self,
+        request: Request<BindWebSessionRequest>,
+    ) -> Result<Response<BindWebSessionResponse>, Status> {
+        let metadata = super::provider_request_metadata(&request, &self.runtime_settings)?;
+        let req = request.into_inner();
+        let api = self.api.clone();
+        let executor_api = api.clone();
+        let web_session_service = self.web_session_service.clone();
+
+        executor_api
+            .execute_user_endpoint(&metadata, EndpointRateLimitCategory::Write, move |validated| {
+                let web_session_service = web_session_service.clone();
+                async move {
+                    validate_proto_request(&req)?;
+                    let provider = web_session_provider_from_proto(req.provider)?;
+                    let cookies = req
+                        .cookies
+                        .into_iter()
+                        .map(|cookie| ProviderWebSessionCookie {
+                            name: cookie.name,
+                            value: cookie.value,
+                            domain: cookie.domain,
+                            path: cookie.path,
+                            secure: cookie.secure,
+                            http_only: cookie.http_only,
+                            session_only: cookie.session_only,
+                            expires_at: cookie.expires_at,
+                        })
+                        .collect();
+                    let binding = web_session_service
+                        .bind(CoreBindWebSessionRequest {
+                            user_id: validated.user_id,
+                            provider,
+                            label: req.label,
+                            cookies,
+                        })
+                        .await
+                        .map_err(ApiError::from)?;
+                    Ok(BindWebSessionResponse {
+                        binding: Some(web_session_binding_to_proto(binding)?),
+                    })
+                }
+            })
+            .await
+            .map(Response::new)
+            .map_err(map_api_error)
+    }
+
+    async fn list_web_sessions(
+        &self,
+        request: Request<ListWebSessionsRequest>,
+    ) -> Result<Response<ListWebSessionsResponse>, Status> {
+        let metadata = super::provider_request_metadata(&request, &self.runtime_settings)?;
+        let req = request.into_inner();
+        let api = self.api.clone();
+        let executor_api = api.clone();
+        let web_session_service = self.web_session_service.clone();
+
+        executor_api
+            .execute_user_endpoint(&metadata, EndpointRateLimitCategory::Read, move |validated| {
+                let web_session_service = web_session_service.clone();
+                async move {
+                    validate_proto_request(&req)?;
+                    let bindings = web_session_service
+                        .list(validated.user_id)
+                        .await
+                        .map_err(ApiError::from)?
+                        .into_iter()
+                        .map(web_session_binding_to_proto)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(ListWebSessionsResponse { bindings })
+                }
+            })
+            .await
+            .map(Response::new)
+            .map_err(map_api_error)
+    }
+
+    async fn unbind_web_session(
+        &self,
+        request: Request<UnbindWebSessionRequest>,
+    ) -> Result<Response<UnbindWebSessionResponse>, Status> {
+        let metadata = super::provider_request_metadata(&request, &self.runtime_settings)?;
+        let req = request.into_inner();
+        let api = self.api.clone();
+        let executor_api = api.clone();
+        let web_session_service = self.web_session_service.clone();
+
+        executor_api
+            .execute_user_endpoint(&metadata, EndpointRateLimitCategory::Write, move |validated| {
+                let web_session_service = web_session_service.clone();
+                async move {
+                    validate_proto_request(&req)?;
+                    let provider = web_session_provider_from_proto(req.provider)?;
+                    let removed = web_session_service
+                        .unbind(validated.user_id, provider)
+                        .await
+                        .map_err(ApiError::from)?;
+                    Ok(UnbindWebSessionResponse { removed })
+                }
+            })
             .await
             .map(Response::new)
             .map_err(map_api_error)
