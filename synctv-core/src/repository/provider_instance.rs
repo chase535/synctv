@@ -133,6 +133,11 @@ impl EncryptedCredentialValue {
 enum StoredProviderCredential {
     #[serde(rename = "bilibili")]
     Bilibili { cookies: EncryptedCredentialValue },
+    #[serde(rename = "webSession")]
+    WebSession {
+        label: String,
+        cookies: EncryptedCredentialValue,
+    },
     #[serde(rename = "alist")]
     Alist {
         host: String,
@@ -265,6 +270,13 @@ impl StoredProviderCredential {
         let encryption = CredentialEncryptionContext { encryption, aad };
         match data {
             ProviderCredential::Bilibili { cookies } => Ok(Self::Bilibili {
+                cookies: EncryptedCredentialValue::encrypt_json(
+                    encryption,
+                    &serde_json::to_value(cookies)?,
+                )?,
+            }),
+            ProviderCredential::WebSession { label, cookies } => Ok(Self::WebSession {
+                label: label.clone(),
                 cookies: EncryptedCredentialValue::encrypt_json(
                     encryption,
                     &serde_json::to_value(cookies)?,
@@ -484,6 +496,10 @@ impl StoredProviderCredential {
         let encryption = CredentialEncryptionContext { encryption, aad };
         match self {
             Self::Bilibili { cookies } => Ok(ProviderCredential::Bilibili {
+                cookies: serde_json::from_value(cookies.decrypt_json(encryption)?)?,
+            }),
+            Self::WebSession { label, cookies } => Ok(ProviderCredential::WebSession {
+                label: label.clone(),
                 cookies: serde_json::from_value(cookies.decrypt_json(encryption)?)?,
             }),
             Self::Alist {
