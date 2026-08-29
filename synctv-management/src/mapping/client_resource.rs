@@ -253,6 +253,12 @@ pub(crate) fn source_provider_from_proto_filter(
         source_config_proto::SourceProvider::Youtube => {
             Ok(Some(synctv_core::models::SourceProvider::Youtube))
         }
+        source_config_proto::SourceProvider::Iqiyi => {
+            Ok(Some(synctv_core::models::SourceProvider::Iqiyi))
+        }
+        source_config_proto::SourceProvider::TencentVideo => {
+            Ok(Some(synctv_core::models::SourceProvider::TencentVideo))
+        }
     }
 }
 
