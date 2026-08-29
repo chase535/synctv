@@ -9,6 +9,8 @@ pub enum ProviderPlaybackSession {
     Emby(EmbyPlaybackSession),
     Fnos(FnosPlaybackSession),
     Synology(SynologyPlaybackSession),
+    Iqiyi(WebSessionPlaybackSession),
+    TencentVideo(WebSessionPlaybackSession),
 }
 
 impl ProviderPlaybackSession {
@@ -18,8 +20,24 @@ impl ProviderPlaybackSession {
             Self::Emby(_) => SourceProvider::Emby,
             Self::Fnos(_) => SourceProvider::Fnos,
             Self::Synology(_) => SourceProvider::Synology,
+            Self::Iqiyi(_) => SourceProvider::Iqiyi,
+            Self::TencentVideo(_) => SourceProvider::TencentVideo,
         }
     }
+}
+
+/// Non-secret identity for a room-scoped playback allocation backed by a
+/// server-side web-session credential.
+///
+/// This record deliberately does not contain provider cookies, bearer tokens,
+/// resolved media URLs, or DRM material. Sensitive authenticated state remains
+/// in the encrypted credential/access cache; the playback-session row only
+/// binds a room generation to the credential revision that produced it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebSessionPlaybackSession {
+    pub server_id: String,
+    pub credential_revision: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +175,38 @@ mod tests {
         assert_eq!(decoded, session);
         assert_eq!(decoded.provider(), SourceProvider::Fnos);
         Ok(())
+    }
+
+    #[test]
+    fn web_session_playback_session_round_trips_without_secrets() -> std::result::Result<(), String> {
+        let session = ProviderPlaybackSession::Iqiyi(WebSessionPlaybackSession {
+            server_id: "web-session".to_string(),
+            credential_revision: "revision-1".to_string(),
+        });
+
+        let json = serde_json::to_value(&session).map_err(|error| error.to_string())?;
+        assert_eq!(json["provider"], "iqiyi");
+        assert_eq!(json["data"]["serverId"], "web-session");
+        assert_eq!(json["data"]["credentialRevision"], "revision-1");
+        assert!(json["data"].get("cookies").is_none());
+        assert!(json["data"].get("url").is_none());
+        assert!(json["data"].get("token").is_none());
+
+        let decoded: ProviderPlaybackSession =
+            serde_json::from_value(json).map_err(|error| error.to_string())?;
+        assert_eq!(decoded, session);
+        assert_eq!(decoded.provider(), SourceProvider::Iqiyi);
+        Ok(())
+    }
+
+    #[test]
+    fn tencent_web_session_reports_tencent_provider() {
+        let session = ProviderPlaybackSession::TencentVideo(WebSessionPlaybackSession {
+            server_id: "web-session".to_string(),
+            credential_revision: "revision-2".to_string(),
+        });
+
+        assert_eq!(session.provider(), SourceProvider::TencentVideo);
     }
 
     #[test]
