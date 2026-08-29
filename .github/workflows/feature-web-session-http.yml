@@ -8,6 +8,7 @@ on:
     paths:
       - .github/workflows/feature-web-session-http.yml
       - tool/feature_web_session_http_patch.py
+      - tool/feature_iqiyi_tencent_convert_patch.py
 
 permissions:
   contents: write
@@ -22,17 +23,22 @@ jobs:
           fetch-depth: 0
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler nasm libclang-dev
-      - name: Patch provider WebSession HTTP adapter
-        run: python3 tool/feature_web_session_http_patch.py
+      - name: Patch provider conversion and WebSession HTTP adapter
+        run: |
+          python3 tool/feature_iqiyi_tencent_convert_patch.py
+          python3 tool/feature_web_session_http_patch.py
       - name: Format and compile HTTP API
         run: |
           cargo fmt --all
           cargo check -p synctv-api-http
       - name: Commit implementation and remove helper files
         run: |
-          git rm .github/workflows/feature-web-session-http.yml tool/feature_web_session_http_patch.py
+          git rm .github/workflows/feature-web-session-http.yml \
+            tool/feature_web_session_http_patch.py \
+            tool/feature_iqiyi_tencent_convert_patch.py
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add synctv-api-http/src/providers/common.rs
+          git add synctv-api-http/src/providers/common.rs \
+            synctv-api-common/src/impls/client/convert.rs
           git commit -m "Expose provider web sessions over HTTP"
           git push origin HEAD:refactor/room-provider-session
