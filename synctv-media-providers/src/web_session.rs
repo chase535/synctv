@@ -43,7 +43,7 @@ impl SessionCookie {
             return false;
         }
         let path = if self.path.is_empty() { "/" } else { &self.path };
-        url.path().starts_with(path)
+        cookie_path_matches(url.path(), path)
     }
 }
 
@@ -144,10 +144,15 @@ fn validate_cookie(
     if cookie
         .value
         .chars()
-        .any(|ch| ch == '\r' || ch == '\n' || ch == '\0')
+        .any(|ch| ch.is_control() || ch == ';')
     {
         return Err(ProviderClientError::InvalidConfig(
             "provider session contains an invalid cookie value".to_string(),
+        ));
+    }
+    if !cookie.path.is_empty() && !cookie.path.starts_with('/') {
+        return Err(ProviderClientError::InvalidConfig(
+            "provider session contains an invalid cookie path".to_string(),
         ));
     }
     let domain = normalize_domain(&cookie.domain);
@@ -174,6 +179,18 @@ fn domain_matches(host: &str, allowed_domain: &str) -> bool {
     !host.is_empty()
         && !allowed.is_empty()
         && (host == allowed || host.ends_with(&format!(".{allowed}")))
+}
+
+fn cookie_path_matches(request_path: &str, cookie_path: &str) -> bool {
+    if cookie_path == "/" || request_path == cookie_path {
+        return true;
+    }
+    request_path.starts_with(cookie_path)
+        && (cookie_path.ends_with('/')
+            || request_path
+                .as_bytes()
+                .get(cookie_path.len())
+                .is_some_and(|byte| *byte == b'/'))
 }
 
 fn unix_timestamp_now() -> i64 {
@@ -237,7 +254,7 @@ mod tests {
                     name: "video".to_string(),
                     value: "value".to_string(),
                     domain: "v.qq.com".to_string(),
-                    path: "/x/".to_string(),
+                    path: "/x".to_string(),
                     secure: false,
                     http_only: false,
                     session_only: true,
@@ -253,7 +270,26 @@ mod tests {
         let http = Url::parse("http://v.qq.com/x/cover").expect("url");
         assert_eq!(client.cookie_header(&http), "video=value");
 
-        let other_path = Url::parse("https://v.qq.com/y/cover").expect("url");
+        let other_path = Url::parse("https://v.qq.com/xyz/cover").expect("url");
         assert_eq!(client.cookie_header(&other_path), "session=secret");
+    }
+
+    #[test]
+    fn rejects_cookie_header_injection() {
+        let result = ScopedWebSessionClient::new(
+            reqwest::Client::new(),
+            &["iqiyi.com"],
+            vec![SessionCookie {
+                name: "session".to_string(),
+                value: "safe; injected=value".to_string(),
+                domain: "iqiyi.com".to_string(),
+                path: "/".to_string(),
+                secure: true,
+                http_only: true,
+                session_only: true,
+                expires_at: None,
+            }],
+        );
+        assert!(result.is_err());
     }
 }
