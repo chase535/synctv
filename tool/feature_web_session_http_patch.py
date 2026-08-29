@@ -145,7 +145,7 @@ pub(crate) async fn bind_web_session(
                     .collect();
                 let binding = service
                     .bind(CoreBindWebSessionRequest {
-                        user_id: validated.user_id,
+                        user_id: validated.user_id(),
                         provider,
                         label: req.label,
                         cookies,
@@ -175,7 +175,7 @@ pub(crate) async fn list_web_sessions(
             EndpointRateLimitCategory::Read,
             move |validated| async move {
                 let bindings = service
-                    .list(validated.user_id)
+                    .list(validated.user_id())
                     .await
                     .map_err(ApiError::from)?
                     .into_iter()
@@ -205,7 +205,7 @@ pub(crate) async fn unbind_web_session(
                 validate_proto_request(&req)?;
                 let provider = web_session_provider_from_proto(req.provider)?;
                 let removed = service
-                    .unbind(validated.user_id, provider)
+                    .unbind(validated.user_id(), provider)
                     .await
                     .map_err(ApiError::from)?;
                 Ok(UnbindWebSessionResponse { removed })
