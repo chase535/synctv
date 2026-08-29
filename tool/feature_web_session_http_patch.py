@@ -152,7 +152,7 @@ pub(crate) async fn bind_web_session(
                     })
                     .await
                     .map_err(ApiError::from)?;
-                Ok(BindWebSessionResponse {
+                Ok::<BindWebSessionResponse, ApiError>(BindWebSessionResponse {
                     binding: Some(web_session_binding_to_proto(binding)?),
                 })
             },
@@ -181,7 +181,7 @@ pub(crate) async fn list_web_sessions(
                     .into_iter()
                     .map(web_session_binding_to_proto)
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(ListWebSessionsResponse { bindings })
+                Ok::<ListWebSessionsResponse, ApiError>(ListWebSessionsResponse { bindings })
             },
         )
         .await
@@ -208,7 +208,7 @@ pub(crate) async fn unbind_web_session(
                     .unbind(validated.user_id(), provider)
                     .await
                     .map_err(ApiError::from)?;
-                Ok(UnbindWebSessionResponse { removed })
+                Ok::<UnbindWebSessionResponse, ApiError>(UnbindWebSessionResponse { removed })
             },
         )
         .await
