@@ -1,5 +1,7 @@
+use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use regex::Regex;
 use reqwest::header::COOKIE;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -45,6 +47,15 @@ impl SessionCookie {
         let path = if self.path.is_empty() { "/" } else { &self.path };
         cookie_path_matches(url.path(), path)
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WebPagePlaybackDiscovery {
+    pub page_url: String,
+    pub title: Option<String>,
+    pub media_urls: Vec<String>,
+    pub drm_detected: bool,
 }
 
 #[derive(Clone)]
@@ -116,6 +127,15 @@ impl ScopedWebSessionClient {
         text_with_limit(response).await
     }
 
+    pub async fn discover_page_playback(
+        &self,
+        raw_url: &str,
+    ) -> Result<WebPagePlaybackDiscovery, ProviderClientError> {
+        let page_url = self.validate_url(raw_url)?;
+        let html = self.get_text(page_url.as_str()).await?;
+        discover_web_page_playback(&page_url, &html)
+    }
+
     fn cookie_header(&self, url: &Url) -> String {
         let now = unix_timestamp_now();
         self.cookies
@@ -124,6 +144,88 @@ impl ScopedWebSessionClient {
             .map(|cookie| format!("{}={}", cookie.name, cookie.value))
             .collect::<Vec<_>>()
             .join("; ")
+    }
+}
+
+pub fn discover_web_page_playback(
+    page_url: &Url,
+    html: &str,
+) -> Result<WebPagePlaybackDiscovery, ProviderClientError> {
+    let title_regex = Regex::new(r"(?is)<title\b[^>]*>(.*?)</title>")
+        .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
+    let source_regex = Regex::new(
+        r#"(?is)<(?:video|source)\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']"#,
+    )
+    .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
+    let content_url_regex = Regex::new(r#"(?is)"contentUrl"\s*:\s*"((?:\\.|[^"\\])*)""#)
+        .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
+
+    let title = title_regex
+        .captures(html)
+        .and_then(|captures| captures.get(1))
+        .map(|value| html_escape::decode_html_entities(value.as_str()).trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let mut seen = HashSet::new();
+    let mut media_urls = Vec::new();
+    for captures in source_regex.captures_iter(html) {
+        let Some(raw) = captures.get(1) else {
+            continue;
+        };
+        let decoded = html_escape::decode_html_entities(raw.as_str());
+        push_media_url(page_url, decoded.as_ref(), &mut seen, &mut media_urls);
+    }
+    for captures in content_url_regex.captures_iter(html) {
+        let Some(raw) = captures.get(1) else {
+            continue;
+        };
+        let encoded = format!("\"{}\"", raw.as_str());
+        let Ok(decoded) = serde_json::from_str::<String>(&encoded) else {
+            continue;
+        };
+        push_media_url(page_url, &decoded, &mut seen, &mut media_urls);
+    }
+
+    let lowercase = html.to_ascii_lowercase();
+    let drm_detected = [
+        "widevine",
+        "playready",
+        "fairplay",
+        "com.widevine.alpha",
+        "licenseurl",
+        "license_url",
+        "drmlicense",
+    ]
+    .iter()
+    .any(|marker| lowercase.contains(marker));
+
+    Ok(WebPagePlaybackDiscovery {
+        page_url: page_url.as_str().to_string(),
+        title,
+        media_urls,
+        drm_detected,
+    })
+}
+
+fn push_media_url(
+    page_url: &Url,
+    raw_url: &str,
+    seen: &mut HashSet<String>,
+    output: &mut Vec<String>,
+) {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() || trimmed.starts_with("blob:") || trimmed.starts_with("data:") {
+        return;
+    }
+    let Ok(url) = page_url.join(trimmed) else {
+        return;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return;
+    }
+    let normalized = url.to_string();
+    if seen.insert(normalized.clone()) {
+        output.push(normalized);
     }
 }
 
@@ -291,5 +393,43 @@ mod tests {
             }],
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn discovers_only_http_media_from_page_markup() {
+        let page_url = Url::parse("https://www.iqiyi.com/v_demo.html").expect("page url");
+        let html = r#"
+            <html><head><title> Demo &amp; VIP </title></head><body>
+              <video src="https://cdn.example/video.mp4"></video>
+              <source src="/media/master.m3u8" />
+              <source src="blob:https://www.iqiyi.com/id" />
+              <script type="application/ld+json">
+                {"contentUrl":"https:\/\/cdn.example\/manifest.mpd"}
+              </script>
+            </body></html>
+        "#;
+
+        let discovery = discover_web_page_playback(&page_url, html).expect("discovery");
+        assert_eq!(discovery.title.as_deref(), Some("Demo & VIP"));
+        assert_eq!(discovery.media_urls.len(), 3);
+        assert_eq!(discovery.media_urls[0], "https://cdn.example/video.mp4");
+        assert_eq!(
+            discovery.media_urls[1],
+            "https://www.iqiyi.com/media/master.m3u8"
+        );
+        assert_eq!(discovery.media_urls[2], "https://cdn.example/manifest.mpd");
+        assert!(!discovery.drm_detected);
+    }
+
+    #[test]
+    fn reports_drm_markers_without_attempting_license_resolution() {
+        let page_url = Url::parse("https://v.qq.com/x/cover/demo.html").expect("page url");
+        let discovery = discover_web_page_playback(
+            &page_url,
+            r#"<script>const keySystem = "com.widevine.alpha";</script>"#,
+        )
+        .expect("discovery");
+        assert!(discovery.drm_detected);
+        assert!(discovery.media_urls.is_empty());
     }
 }
