@@ -34,13 +34,16 @@ pub mod douyu;
 pub mod emby;
 pub mod fnos;
 pub mod huya;
+pub mod iqiyi;
 pub mod nextcloud;
 pub mod qnap;
 pub mod seafile;
 pub mod synology;
+pub mod tencent_video;
 pub mod tiktok;
 pub mod truenas;
 pub mod twitch;
+pub mod web_session;
 pub mod youtube;
 
 // gRPC servers (wrap HTTP clients)
@@ -57,6 +60,8 @@ pub use alist::{AlistClient, AlistError};
 pub use bilibili::{BilibiliClient, BilibiliError};
 pub use cloudreve::CloudreveClient;
 pub use emby::{EmbyClient, EmbyError};
+pub use iqiyi::IqiyiClient;
+pub use tencent_video::TencentVideoClient;
 pub use error::{
     check_response, fetch_json, json_with_limit, provider_backoff, text_with_limit, with_retry,
     ProviderClientError, MAX_RESPONSE_SIZE, PROVIDER_USER_AGENT,
