@@ -178,7 +178,8 @@ mod tests {
     }
 
     #[test]
-    fn web_session_playback_session_round_trips_without_secrets() -> std::result::Result<(), String> {
+    fn web_session_playback_session_round_trips_without_secrets() -> std::result::Result<(), String>
+    {
         let session = ProviderPlaybackSession::Iqiyi(WebSessionPlaybackSession {
             server_id: "web-session".to_string(),
             credential_revision: "revision-1".to_string(),

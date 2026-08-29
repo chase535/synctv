@@ -313,7 +313,12 @@ fn filter_for_client(
         })
         .collect();
     if !result.playback_infos.contains_key(&original_default) {
-        result.default_mode = result.playback_infos.keys().min().cloned().unwrap_or_default();
+        result.default_mode = result
+            .playback_infos
+            .keys()
+            .min()
+            .cloned()
+            .unwrap_or_default();
     }
     result
 }
@@ -327,8 +332,10 @@ fn validate_url(
     match provider {
         WebSessionProvider::Iqiyi => IqiyiClient::new(http_client.clone(), Vec::new())
             .and_then(|client| client.validate_url(source.url).map(|_| ())),
-        WebSessionProvider::TencentVideo => TencentVideoClient::new(http_client.clone(), Vec::new())
-            .and_then(|client| client.validate_url(source.url).map(|_| ())),
+        WebSessionProvider::TencentVideo => {
+            TencentVideoClient::new(http_client.clone(), Vec::new())
+                .and_then(|client| client.validate_url(source.url).map(|_| ()))
+        }
     }
     .map_err(provider_client_error)
 }
@@ -368,9 +375,10 @@ async fn generate_playback(
     let db = ctx.db.ok_or_else(|| {
         ProviderError::Internal("provider database context is not configured".to_string())
     })?;
-    let store = ctx.store.clone().ok_or_else(|| {
-        ProviderError::Internal("provider store is not configured".to_string())
-    })?;
+    let store = ctx
+        .store
+        .clone()
+        .ok_or_else(|| ProviderError::Internal("provider store is not configured".to_string()))?;
     let room_id = ctx
         .room_id
         .ok_or_else(|| ProviderError::MissingField("room_id".to_string()))?;

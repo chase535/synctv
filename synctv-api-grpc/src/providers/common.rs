@@ -7,8 +7,8 @@ use synctv_api_common::impls::admin::RequestContext;
 use synctv_api_common::impls::{validate_proto_request, ApiError, EndpointRateLimitCategory};
 use synctv_core::models::provider_instance::ProviderWebSessionCookie;
 use synctv_core::service::{
-    BindWebSessionRequest as CoreBindWebSessionRequest,
-    WebSessionBinding as CoreWebSessionBinding, WebSessionCredentialService, WebSessionProvider,
+    BindWebSessionRequest as CoreBindWebSessionRequest, WebSessionBinding as CoreWebSessionBinding,
+    WebSessionCredentialService, WebSessionProvider,
 };
 use synctv_proto::source_config::SourceProvider as ProtoSourceProvider;
 
@@ -233,39 +233,43 @@ impl ProviderCommonService for ProviderCommonGrpcService {
         let web_session_service = self.web_session_service.clone();
 
         executor_api
-            .execute_user_endpoint(&metadata, EndpointRateLimitCategory::Write, move |validated| {
-                let web_session_service = web_session_service.clone();
-                async move {
-                    validate_proto_request(&req)?;
-                    let provider = web_session_provider_from_proto(req.provider)?;
-                    let cookies = req
-                        .cookies
-                        .into_iter()
-                        .map(|cookie| ProviderWebSessionCookie {
-                            name: cookie.name,
-                            value: cookie.value,
-                            domain: cookie.domain,
-                            path: cookie.path,
-                            secure: cookie.secure,
-                            http_only: cookie.http_only,
-                            session_only: cookie.session_only,
-                            expires_at: cookie.expires_at,
+            .execute_user_endpoint(
+                &metadata,
+                EndpointRateLimitCategory::Write,
+                move |validated| {
+                    let web_session_service = web_session_service.clone();
+                    async move {
+                        validate_proto_request(&req)?;
+                        let provider = web_session_provider_from_proto(req.provider)?;
+                        let cookies = req
+                            .cookies
+                            .into_iter()
+                            .map(|cookie| ProviderWebSessionCookie {
+                                name: cookie.name,
+                                value: cookie.value,
+                                domain: cookie.domain,
+                                path: cookie.path,
+                                secure: cookie.secure,
+                                http_only: cookie.http_only,
+                                session_only: cookie.session_only,
+                                expires_at: cookie.expires_at,
+                            })
+                            .collect();
+                        let binding = web_session_service
+                            .bind(CoreBindWebSessionRequest {
+                                user_id: validated.user_id,
+                                provider,
+                                label: req.label,
+                                cookies,
+                            })
+                            .await
+                            .map_err(ApiError::from)?;
+                        Ok(BindWebSessionResponse {
+                            binding: Some(web_session_binding_to_proto(binding)?),
                         })
-                        .collect();
-                    let binding = web_session_service
-                        .bind(CoreBindWebSessionRequest {
-                            user_id: validated.user_id,
-                            provider,
-                            label: req.label,
-                            cookies,
-                        })
-                        .await
-                        .map_err(ApiError::from)?;
-                    Ok(BindWebSessionResponse {
-                        binding: Some(web_session_binding_to_proto(binding)?),
-                    })
-                }
-            })
+                    }
+                },
+            )
             .await
             .map(Response::new)
             .map_err(map_api_error)
@@ -282,20 +286,24 @@ impl ProviderCommonService for ProviderCommonGrpcService {
         let web_session_service = self.web_session_service.clone();
 
         executor_api
-            .execute_user_endpoint(&metadata, EndpointRateLimitCategory::Read, move |validated| {
-                let web_session_service = web_session_service.clone();
-                async move {
-                    validate_proto_request(&req)?;
-                    let bindings = web_session_service
-                        .list(validated.user_id)
-                        .await
-                        .map_err(ApiError::from)?
-                        .into_iter()
-                        .map(web_session_binding_to_proto)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok(ListWebSessionsResponse { bindings })
-                }
-            })
+            .execute_user_endpoint(
+                &metadata,
+                EndpointRateLimitCategory::Read,
+                move |validated| {
+                    let web_session_service = web_session_service.clone();
+                    async move {
+                        validate_proto_request(&req)?;
+                        let bindings = web_session_service
+                            .list(validated.user_id)
+                            .await
+                            .map_err(ApiError::from)?
+                            .into_iter()
+                            .map(web_session_binding_to_proto)
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(ListWebSessionsResponse { bindings })
+                    }
+                },
+            )
             .await
             .map(Response::new)
             .map_err(map_api_error)
@@ -312,18 +320,22 @@ impl ProviderCommonService for ProviderCommonGrpcService {
         let web_session_service = self.web_session_service.clone();
 
         executor_api
-            .execute_user_endpoint(&metadata, EndpointRateLimitCategory::Write, move |validated| {
-                let web_session_service = web_session_service.clone();
-                async move {
-                    validate_proto_request(&req)?;
-                    let provider = web_session_provider_from_proto(req.provider)?;
-                    let removed = web_session_service
-                        .unbind(validated.user_id, provider)
-                        .await
-                        .map_err(ApiError::from)?;
-                    Ok(UnbindWebSessionResponse { removed })
-                }
-            })
+            .execute_user_endpoint(
+                &metadata,
+                EndpointRateLimitCategory::Write,
+                move |validated| {
+                    let web_session_service = web_session_service.clone();
+                    async move {
+                        validate_proto_request(&req)?;
+                        let provider = web_session_provider_from_proto(req.provider)?;
+                        let removed = web_session_service
+                            .unbind(validated.user_id, provider)
+                            .await
+                            .map_err(ApiError::from)?;
+                        Ok(UnbindWebSessionResponse { removed })
+                    }
+                },
+            )
             .await
             .map(Response::new)
             .map_err(map_api_error)

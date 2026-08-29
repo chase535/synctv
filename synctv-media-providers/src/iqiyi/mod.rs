@@ -1,6 +1,4 @@
-use crate::web_session::{
-    ScopedWebSessionClient, SessionCookie, WebPagePlaybackDiscovery,
-};
+use crate::web_session::{ScopedWebSessionClient, SessionCookie, WebPagePlaybackDiscovery};
 use crate::ProviderClientError;
 
 pub const IQIYI_SESSION_DOMAINS: &[&str] = &["iqiyi.com"];

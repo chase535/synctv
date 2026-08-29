@@ -410,9 +410,8 @@ mod tests {
         let viewer_id = UserId::expect_positive(23);
         let ctx = ProviderContext::new("test", ProviderActor::User(viewer_id));
 
-        assert!(
-            ctx.resolve_credential_user_id(ProviderCredentialPolicy::ResourceOwner, true)
-                .is_err()
-        );
+        assert!(ctx
+            .resolve_credential_user_id(ProviderCredentialPolicy::ResourceOwner, true)
+            .is_err());
     }
 }

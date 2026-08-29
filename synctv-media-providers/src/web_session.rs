@@ -44,7 +44,11 @@ impl SessionCookie {
         if self.secure && url.scheme() != "https" {
             return false;
         }
-        let path = if self.path.is_empty() { "/" } else { &self.path };
+        let path = if self.path.is_empty() {
+            "/"
+        } else {
+            &self.path
+        };
         cookie_path_matches(url.path(), path)
     }
 }
@@ -153,17 +157,19 @@ pub fn discover_web_page_playback(
 ) -> Result<WebPagePlaybackDiscovery, ProviderClientError> {
     let title_regex = Regex::new(r"(?is)<title\b[^>]*>(.*?)</title>")
         .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
-    let source_regex = Regex::new(
-        r#"(?is)<(?:video|source)\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']"#,
-    )
-    .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
+    let source_regex = Regex::new(r#"(?is)<(?:video|source)\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']"#)
+        .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
     let content_url_regex = Regex::new(r#"(?is)"contentUrl"\s*:\s*"((?:\\.|[^"\\])*)""#)
         .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
 
     let title = title_regex
         .captures(html)
         .and_then(|captures| captures.get(1))
-        .map(|value| html_escape::decode_html_entities(value.as_str()).trim().to_string())
+        .map(|value| {
+            html_escape::decode_html_entities(value.as_str())
+                .trim()
+                .to_string()
+        })
         .filter(|value| !value.is_empty());
 
     let mut seen = HashSet::new();
@@ -243,11 +249,7 @@ fn validate_cookie(
             "provider session contains an invalid cookie name".to_string(),
         ));
     }
-    if cookie
-        .value
-        .chars()
-        .any(|ch| ch.is_control() || ch == ';')
-    {
+    if cookie.value.chars().any(|ch| ch.is_control() || ch == ';') {
         return Err(ProviderClientError::InvalidConfig(
             "provider session contains an invalid cookie value".to_string(),
         ));
@@ -340,9 +342,7 @@ mod tests {
         )
         .expect("session client");
         assert!(client.validate_url("https://example.com/video").is_err());
-        assert!(client
-            .validate_url("https://www.iqiyi.com/video")
-            .is_ok());
+        assert!(client.validate_url("https://www.iqiyi.com/video").is_ok());
     }
 
     #[test]

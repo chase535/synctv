@@ -291,14 +291,14 @@ impl ProvidersManager {
             Box::new(move |_instance_id, config, _instance_manager| {
                 let client = match provider_http_client_from_config(config, &ssrf_guard_iqiyi)? {
                     Some(client) => client,
-                    None => synctv_media_providers::build_provider_http_client(
-                        ssrf_guard_iqiyi.clone(),
-                    )
-                    .map_err(|error| {
-                        crate::Error::Internal(format!(
-                            "Failed to build iQiyi provider HTTP client: {error}"
-                        ))
-                    })?,
+                    None => {
+                        synctv_media_providers::build_provider_http_client(ssrf_guard_iqiyi.clone())
+                            .map_err(|error| {
+                                crate::Error::Internal(format!(
+                                    "Failed to build iQiyi provider HTTP client: {error}"
+                                ))
+                            })?
+                    }
                 };
                 Ok(Arc::new(IqiyiProvider::with_http_client(client)))
             }),
@@ -308,17 +308,18 @@ impl ProvidersManager {
         self.register_factory(
             TencentVideoProvider::NAME,
             Box::new(move |_instance_id, config, _instance_manager| {
-                let client = match provider_http_client_from_config(config, &ssrf_guard_tencent_video)? {
-                    Some(client) => client,
-                    None => synctv_media_providers::build_provider_http_client(
-                        ssrf_guard_tencent_video.clone(),
-                    )
-                    .map_err(|error| {
-                        crate::Error::Internal(format!(
-                            "Failed to build Tencent Video provider HTTP client: {error}"
-                        ))
-                    })?,
-                };
+                let client =
+                    match provider_http_client_from_config(config, &ssrf_guard_tencent_video)? {
+                        Some(client) => client,
+                        None => synctv_media_providers::build_provider_http_client(
+                            ssrf_guard_tencent_video.clone(),
+                        )
+                        .map_err(|error| {
+                            crate::Error::Internal(format!(
+                                "Failed to build Tencent Video provider HTTP client: {error}"
+                            ))
+                        })?,
+                    };
                 Ok(Arc::new(TencentVideoProvider::with_http_client(client)))
             }),
         );

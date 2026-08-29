@@ -12,7 +12,9 @@ use crate::{
         ProviderCredential, ProviderPlaybackSession, ProviderWebSessionCookie, RoomId, UserId,
         UserProviderCredential, WebSessionPlaybackSession,
     },
-    provider::{credential_resolver::credential_revision, ProviderStore, ProviderStoreExt, StoreError},
+    provider::{
+        credential_resolver::credential_revision, ProviderStore, ProviderStoreExt, StoreError,
+    },
     repository::{
         NewProviderPlaybackSession, ProviderPlaybackSessionRepository,
         UserProviderCredentialRepository,
@@ -139,7 +141,9 @@ fn validate_web_session_cookies(
 
     let cookies = session_cookies(cookies);
     let result = match provider {
-        WebSessionProvider::Iqiyi => IqiyiClient::new(http_client.clone(), cookies.clone()).map(|_| ()),
+        WebSessionProvider::Iqiyi => {
+            IqiyiClient::new(http_client.clone(), cookies.clone()).map(|_| ())
+        }
         WebSessionProvider::TencentVideo => {
             TencentVideoClient::new(http_client.clone(), cookies.clone()).map(|_| ())
         }
@@ -241,7 +245,8 @@ impl WebSessionCredentialService {
                 provider.as_str()
             )));
         };
-        if credential.provider != provider.as_str() || credential.server_id != WEB_SESSION_SERVER_ID {
+        if credential.provider != provider.as_str() || credential.server_id != WEB_SESSION_SERVER_ID
+        {
             return Err(Error::InvalidInput(
                 "provider web-session credential identity mismatch".to_string(),
             ));
@@ -272,7 +277,10 @@ impl WebSessionCredentialService {
             )
             .await?
         {
-            if !matches!(existing.credential_data, ProviderCredential::WebSession { .. }) {
+            if !matches!(
+                existing.credential_data,
+                ProviderCredential::WebSession { .. }
+            ) {
                 return Err(Error::Conflict(format!(
                     "{} credential slot already contains a different credential type",
                     request.provider.as_str()
@@ -326,7 +334,10 @@ impl WebSessionCredentialService {
             return Ok(false);
         };
 
-        if !matches!(credential.credential_data, ProviderCredential::WebSession { .. }) {
+        if !matches!(
+            credential.credential_data,
+            ProviderCredential::WebSession { .. }
+        ) {
             return Err(Error::Conflict(format!(
                 "{} credential slot contains a different credential type",
                 provider.as_str()

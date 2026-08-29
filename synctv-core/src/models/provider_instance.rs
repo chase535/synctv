@@ -637,10 +637,7 @@ mod tests {
                 expires_at: None,
             }],
         };
-        assert!(matches!(
-            web_session,
-            ProviderCredential::WebSession { .. }
-        ));
+        assert!(matches!(web_session, ProviderCredential::WebSession { .. }));
 
         let alist = ProviderCredential::Alist {
             host: "https://alist.example.com".to_string(),

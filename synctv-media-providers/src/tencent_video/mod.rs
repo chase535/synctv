@@ -1,6 +1,4 @@
-use crate::web_session::{
-    ScopedWebSessionClient, SessionCookie, WebPagePlaybackDiscovery,
-};
+use crate::web_session::{ScopedWebSessionClient, SessionCookie, WebPagePlaybackDiscovery};
 use crate::ProviderClientError;
 
 pub const TENCENT_VIDEO_SESSION_DOMAINS: &[&str] = &["qq.com"];
@@ -16,11 +14,7 @@ impl TencentVideoClient {
         cookies: Vec<SessionCookie>,
     ) -> Result<Self, ProviderClientError> {
         Ok(Self {
-            session: ScopedWebSessionClient::new(
-                client,
-                TENCENT_VIDEO_SESSION_DOMAINS,
-                cookies,
-            )?,
+            session: ScopedWebSessionClient::new(client, TENCENT_VIDEO_SESSION_DOMAINS, cookies)?,
         })
     }
 
