@@ -5,6 +5,7 @@
 //! provider configuration.
 
 use crate::models::normalize_provider_instance_name;
+use crate::provider::provider_client::web_session_video::{IqiyiProvider, TencentVideoProvider};
 use crate::provider::{
     AcFunProvider, AlistProvider, BilibiliProvider, CctvProvider, CloudreveProvider,
     DirectUrlProvider, DouyinProvider, DouyuProvider, EmbyProvider, FnosProvider, HuyaProvider,
@@ -281,6 +282,44 @@ impl ProvidersManager {
                     instance_manager,
                     client_manager,
                 )))
+            }),
+        );
+
+        let ssrf_guard_iqiyi = ssrf_guard.clone();
+        self.register_factory(
+            IqiyiProvider::NAME,
+            Box::new(move |_instance_id, config, _instance_manager| {
+                let client = match provider_http_client_from_config(config, &ssrf_guard_iqiyi)? {
+                    Some(client) => client,
+                    None => synctv_media_providers::build_provider_http_client(
+                        ssrf_guard_iqiyi.clone(),
+                    )
+                    .map_err(|error| {
+                        crate::Error::Internal(format!(
+                            "Failed to build iQiyi provider HTTP client: {error}"
+                        ))
+                    })?,
+                };
+                Ok(Arc::new(IqiyiProvider::with_http_client(client)))
+            }),
+        );
+
+        let ssrf_guard_tencent_video = ssrf_guard.clone();
+        self.register_factory(
+            TencentVideoProvider::NAME,
+            Box::new(move |_instance_id, config, _instance_manager| {
+                let client = match provider_http_client_from_config(config, &ssrf_guard_tencent_video)? {
+                    Some(client) => client,
+                    None => synctv_media_providers::build_provider_http_client(
+                        ssrf_guard_tencent_video.clone(),
+                    )
+                    .map_err(|error| {
+                        crate::Error::Internal(format!(
+                            "Failed to build Tencent Video provider HTTP client: {error}"
+                        ))
+                    })?,
+                };
+                Ok(Arc::new(TencentVideoProvider::with_http_client(client)))
             }),
         );
 
@@ -882,7 +921,9 @@ mod tests {
         assert!(types.contains(&"nextcloud".to_string()));
         assert!(types.contains(&"seafile".to_string()));
         assert!(types.contains(&"truenas".to_string()));
-        assert_eq!(types.len(), 21);
+        assert!(types.contains(&"iqiyi".to_string()));
+        assert!(types.contains(&"tencent_video".to_string()));
+        assert_eq!(types.len(), 23);
     }
 
     #[tokio::test]
