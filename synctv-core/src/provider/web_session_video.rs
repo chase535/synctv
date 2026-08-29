@@ -31,6 +31,7 @@ use crate::service::web_session::{
 };
 
 const ROOM_PLAYBACK_CACHE_TTL: Duration = Duration::from_secs(120);
+const SIGNED_URL_EXPIRY_MARGIN_SECONDS: i64 = 5;
 
 #[derive(Clone)]
 pub struct IqiyiProvider {
@@ -203,6 +204,30 @@ fn core_error(error: crate::Error) -> ProviderError {
     }
 }
 
+fn signed_url_expiry(url: &str) -> Option<i64> {
+    crate::provider::url_expiration_timestamp(url)
+}
+
+fn discovery_cache_ttl(discovery: &WebPagePlaybackDiscovery) -> Duration {
+    let now = crate::SystemClock.now().timestamp();
+    let signed_ttl = discovery
+        .media_urls
+        .iter()
+        .filter_map(|url| signed_url_expiry(url))
+        .map(|expires_at| {
+            expires_at
+                .saturating_sub(now)
+                .saturating_sub(SIGNED_URL_EXPIRY_MARGIN_SECONDS)
+        })
+        .filter(|ttl| *ttl > 0)
+        .min()
+        .and_then(|ttl| u64::try_from(ttl).ok())
+        .map(Duration::from_secs);
+    signed_ttl
+        .map(|ttl| ttl.min(ROOM_PLAYBACK_CACHE_TTL))
+        .unwrap_or(ROOM_PLAYBACK_CACHE_TTL)
+}
+
 fn playback_from_discovery(
     provider: WebSessionProvider,
     discovery: WebPagePlaybackDiscovery,
@@ -213,33 +238,45 @@ fn playback_from_discovery(
             provider.as_str()
         )));
     }
-    if discovery.media_urls.is_empty() {
-        return Err(ProviderError::UnsupportedFormat(format!(
-            "{} authenticated page did not expose a credential-free HTTP(S) playback resource",
-            provider.as_str()
-        )));
-    }
 
+    let now = crate::SystemClock.now().timestamp();
     let medias = discovery
         .media_urls
         .into_iter()
+        .filter_map(|url| {
+            let expires_at = signed_url_expiry(&url);
+            if expires_at.is_some_and(|expires_at| expires_at <= now) {
+                return None;
+            }
+            Some(PlaybackMedia {
+                name: String::new(),
+                format: detect_direct_url_format(&url).to_string(),
+                expire_at: expires_at.and_then(|value| chrono::DateTime::from_timestamp(value, 0)),
+                metadata: None,
+                p2p_swarm_id: None,
+                provider: PlaybackMediaProvider::DirectUrl(PlaybackDirectUrlMedia::Direct {
+                    url,
+                    headers: HashMap::new(),
+                }),
+            })
+        })
         .enumerate()
-        .map(|(index, url)| PlaybackMedia {
-            name: if index == 0 {
+        .map(|(index, mut media)| {
+            media.name = if index == 0 {
                 "Default".to_string()
             } else {
                 format!("Source {}", index + 1)
-            },
-            format: detect_direct_url_format(&url).to_string(),
-            expire_at: None,
-            metadata: None,
-            p2p_swarm_id: None,
-            provider: PlaybackMediaProvider::DirectUrl(PlaybackDirectUrlMedia::Direct {
-                url,
-                headers: HashMap::new(),
-            }),
+            };
+            media
         })
-        .collect();
+        .collect::<Vec<_>>();
+
+    if medias.is_empty() {
+        return Err(ProviderError::UnsupportedFormat(format!(
+            "{} authenticated page did not expose a current credential-free HTTP(S) playback resource",
+            provider.as_str()
+        )));
+    }
 
     Ok(PlaybackResult {
         playback_infos: HashMap::from([(
@@ -263,7 +300,25 @@ fn playback_from_discovery(
     })
 }
 
-async fn validate_url(
+fn filter_for_client(
+    mut result: PlaybackResult,
+    profile: Option<&crate::provider::PlaybackClientProfile>,
+) -> PlaybackResult {
+    let original_default = result.default_mode.clone();
+    result.playback_infos = std::mem::take(&mut result.playback_infos)
+        .into_iter()
+        .filter_map(|(mode_name, info)| {
+            crate::provider::build_direct_playback_info_for_client(&mode_name, &info, profile)
+                .map(|info| (mode_name, info))
+        })
+        .collect();
+    if !result.playback_infos.contains_key(&original_default) {
+        result.default_mode = result.playback_infos.keys().min().cloned().unwrap_or_default();
+    }
+    result
+}
+
+fn validate_url(
     http_client: &reqwest::Client,
     provider: WebSessionProvider,
     source: WebVideoSource<'_>,
@@ -358,16 +413,16 @@ async fn generate_playback(
                         .map_err(provider_client_error)?
                 }
             };
+            let cache_ttl = discovery_cache_ttl(&discovery);
             let value = playback_from_discovery(provider, discovery).map_err(crate::Error::from)?;
-            Ok(WebSessionResolvedPlayback {
-                value,
-                cache_ttl: ROOM_PLAYBACK_CACHE_TTL,
-            })
+            Ok(WebSessionResolvedPlayback { value, cache_ttl })
         })
         .await
         .map_err(core_error)?;
 
-    super::require_compatible_playback_route(result, source.proxy_mode, ctx.playback_client_profile())
+    let profile = ctx.playback_client_profile();
+    let result = filter_for_client(result, profile);
+    super::require_compatible_playback_route(result, source.proxy_mode, profile)
 }
 
 #[async_trait]
@@ -423,7 +478,6 @@ impl MediaProvider for IqiyiProvider {
             WebSessionProvider::Iqiyi,
             source_from(source_config, WebSessionProvider::Iqiyi)?,
         )
-        .await
     }
 
     fn credential_dependencies(
@@ -488,7 +542,6 @@ impl MediaProvider for TencentVideoProvider {
             WebSessionProvider::TencentVideo,
             source_from(source_config, WebSessionProvider::TencentVideo)?,
         )
-        .await
     }
 
     fn credential_dependencies(
@@ -567,5 +620,22 @@ mod tests {
             drm_detected: true,
         };
         assert!(playback_from_discovery(WebSessionProvider::Iqiyi, discovery).is_err());
+    }
+
+    #[test]
+    fn room_cache_ttl_respects_signed_url_expiry() {
+        let now = crate::SystemClock.now().timestamp();
+        let discovery = WebPagePlaybackDiscovery {
+            page_url: "https://www.iqiyi.com/v_demo.html".to_string(),
+            title: None,
+            media_urls: vec![format!(
+                "https://cdn.example/video.mp4?AWSAccessKeyId=key&Signature=sig&Expires={}",
+                now + 30
+            )],
+            drm_detected: false,
+        };
+        let ttl = discovery_cache_ttl(&discovery);
+        assert!(ttl <= Duration::from_secs(25));
+        assert!(ttl >= Duration::from_secs(20));
     }
 }
