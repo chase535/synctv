@@ -1081,6 +1081,20 @@ pub fn media_source_config_to_proto(
                 shared: config.shared,
             })
         }
+        synctv_core::models::MediaSourceConfig::Iqiyi(config) => {
+            Provider::Iqiyi(source_config_proto::IqiyiMediaSourceConfig {
+                url: config.url,
+                shared: config.shared,
+                proxy_mode: playback_proxy_mode_to_proto(config.proxy_mode),
+            })
+        }
+        synctv_core::models::MediaSourceConfig::TencentVideo(config) => {
+            Provider::TencentVideo(source_config_proto::TencentVideoMediaSourceConfig {
+                url: config.url,
+                shared: config.shared,
+                proxy_mode: playback_proxy_mode_to_proto(config.proxy_mode),
+            })
+        }
         synctv_core::models::MediaSourceConfig::Huya(config) => {
             Provider::Huya(huya_media_source_config_to_proto(config))
         }
@@ -3032,6 +3046,8 @@ fn media_resource_metadata_to_proto(
         synctv_core::models::MediaSourceConfig::Youtube(config) => {
             format!("https://www.youtube.com/watch?v={}", config.video_id)
         }
+        synctv_core::models::MediaSourceConfig::Iqiyi(config) => config.url.clone(),
+        synctv_core::models::MediaSourceConfig::TencentVideo(config) => config.url.clone(),
         synctv_core::models::MediaSourceConfig::Huya(config) => match config {
             synctv_core::models::HuyaMediaSourceConfig::Live { room_id } => {
                 format!("https://www.huya.com/{room_id}")
