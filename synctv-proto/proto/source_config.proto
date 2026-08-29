@@ -27,6 +27,8 @@ enum SourceProvider {
   SOURCE_PROVIDER_TRUENAS = 19;
   SOURCE_PROVIDER_YOUTUBE = 20;
   SOURCE_PROVIDER_TIKTOK = 21;
+  SOURCE_PROVIDER_IQIYI = 22;
+  SOURCE_PROVIDER_TENCENT_VIDEO = 23;
 }
 
 enum PlaybackKind {
@@ -701,6 +703,24 @@ message TikTokPlaylistSourceConfig {
   bool shared = 2;
 }
 
+message IqiyiMediaSourceConfig {
+  string url = 1 [(buf.validate.field).string = {
+    min_len: 1,
+    max_len: 8192
+  }];
+  bool shared = 2;
+  PlaybackProxyMode proxy_mode = 3 [(buf.validate.field).enum.defined_only = true];
+}
+
+message TencentVideoMediaSourceConfig {
+  string url = 1 [(buf.validate.field).string = {
+    min_len: 1,
+    max_len: 8192
+  }];
+  bool shared = 2;
+  PlaybackProxyMode proxy_mode = 3 [(buf.validate.field).enum.defined_only = true];
+}
+
 message MediaSourceConfig {
   oneof provider {
     DirectUrlMediaSourceConfig direct_url = 1;
@@ -724,6 +744,8 @@ message MediaSourceConfig {
     TrueNasMediaSourceConfig truenas = 19;
     YoutubeMediaSourceConfig youtube = 20;
     TikTokMediaSourceConfig tiktok = 21;
+    IqiyiMediaSourceConfig iqiyi = 22;
+    TencentVideoMediaSourceConfig tencent_video = 23;
   }
 }
 
