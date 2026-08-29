@@ -52,6 +52,7 @@ pub(crate) mod system_stats;
 pub(crate) mod time_partition_manager;
 pub(crate) mod user;
 pub(crate) mod user_notification;
+pub(crate) mod web_session;
 pub(crate) mod ws_ticket;
 
 pub use crate::repository::{
@@ -293,6 +294,10 @@ pub use user::{
     InMemorySensitiveVerificationSessionStore,
 };
 pub use user_notification::{NotificationCreatedEvent, UserNotificationService};
+pub use web_session::{
+    BindWebSessionRequest, WebSessionBinding, WebSessionCredentialService, WebSessionProvider,
+    WEB_SESSION_SERVER_ID,
+};
 pub use ws_ticket::{
     CreateGuestTicketRequest, PendingValidatedTicket, RedisTicketStore, TicketStore,
     UserValidationResult, UserValidator, ValidatedGuestTicket, ValidatedTicket,
