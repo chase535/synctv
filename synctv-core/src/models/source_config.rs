@@ -60,6 +60,8 @@ pub enum MediaSourceConfig {
     Seafile(SeafileMediaSourceConfig),
     TrueNas(TrueNasMediaSourceConfig),
     TikTok(TikTokMediaSourceConfig),
+    Iqiyi(IqiyiMediaSourceConfig),
+    TencentVideo(TencentVideoMediaSourceConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -347,6 +349,26 @@ pub enum BilibiliPgcTimelineType {
     Anime,
     Cinema,
     Guochuang,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IqiyiMediaSourceConfig {
+    pub url: String,
+    #[serde(default)]
+    pub shared: bool,
+    #[serde(default, skip_serializing_if = "PlaybackProxyMode::is_auto")]
+    pub proxy_mode: PlaybackProxyMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TencentVideoMediaSourceConfig {
+    pub url: String,
+    #[serde(default)]
+    pub shared: bool,
+    #[serde(default, skip_serializing_if = "PlaybackProxyMode::is_auto")]
+    pub proxy_mode: PlaybackProxyMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -988,6 +1010,8 @@ impl MediaSourceConfig {
             Self::Nextcloud(_) => SourceProvider::Nextcloud,
             Self::Seafile(_) => SourceProvider::Seafile,
             Self::TrueNas(_) => SourceProvider::TrueNas,
+            Self::Iqiyi(_) => SourceProvider::Iqiyi,
+            Self::TencentVideo(_) => SourceProvider::TencentVideo,
         }
     }
 
@@ -1227,6 +1251,31 @@ mod tests {
                 "aid": null,
                 "cid": 42,
                 "shared": true
+            }),
+        );
+        media_round_trip(
+            &MediaSourceConfig::Iqiyi(IqiyiMediaSourceConfig {
+                url: "https://www.iqiyi.com/v_demo.html".to_string(),
+                shared: true,
+                proxy_mode: PlaybackProxyMode::Auto,
+            }),
+            &json!({
+                "provider": "iqiyi",
+                "url": "https://www.iqiyi.com/v_demo.html",
+                "shared": true
+            }),
+        );
+        media_round_trip(
+            &MediaSourceConfig::TencentVideo(TencentVideoMediaSourceConfig {
+                url: "https://v.qq.com/x/cover/demo.html".to_string(),
+                shared: true,
+                proxy_mode: PlaybackProxyMode::Prefer,
+            }),
+            &json!({
+                "provider": "tencentVideo",
+                "url": "https://v.qq.com/x/cover/demo.html",
+                "shared": true,
+                "proxyMode": "prefer"
             }),
         );
         media_round_trip(
