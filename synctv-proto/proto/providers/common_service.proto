@@ -18,4 +18,7 @@ service ProviderCommonService {
   rpc ReconnectProviderInstance(ReconnectProviderInstanceRequest) returns (ReconnectProviderInstanceResponse);
   rpc EnableProviderInstance(EnableProviderInstanceRequest) returns (EnableProviderInstanceResponse);
   rpc DisableProviderInstance(DisableProviderInstanceRequest) returns (DisableProviderInstanceResponse);
+  rpc BindWebSession(BindWebSessionRequest) returns (BindWebSessionResponse);
+  rpc ListWebSessions(ListWebSessionsRequest) returns (ListWebSessionsResponse);
+  rpc UnbindWebSession(UnbindWebSessionRequest) returns (UnbindWebSessionResponse);
 }
