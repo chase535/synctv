@@ -104,10 +104,10 @@ fn tencent_source(config: &MediaSourceConfig) -> Result<WebVideoSource<'_>, Prov
     })
 }
 
-fn source_from<'a>(
-    source_config: SourceConfig<'a>,
+fn source_from(
+    source_config: SourceConfig<'_>,
     provider: WebSessionProvider,
-) -> Result<WebVideoSource<'a>, ProviderError> {
+) -> Result<WebVideoSource<'_>, ProviderError> {
     let SourceConfig::Media(config) = source_config else {
         return Err(ProviderError::InvalidConfig(format!(
             "{} dynamic playlists are not supported",
@@ -223,9 +223,9 @@ fn discovery_cache_ttl(discovery: &WebPagePlaybackDiscovery) -> Duration {
         .min()
         .and_then(|ttl| u64::try_from(ttl).ok())
         .map(Duration::from_secs);
-    signed_ttl
-        .map(|ttl| ttl.min(ROOM_PLAYBACK_CACHE_TTL))
-        .unwrap_or(ROOM_PLAYBACK_CACHE_TTL)
+    signed_ttl.map_or(ROOM_PLAYBACK_CACHE_TTL, |ttl| {
+        ttl.min(ROOM_PLAYBACK_CACHE_TTL)
+    })
 }
 
 fn playback_from_discovery(
