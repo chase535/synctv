@@ -81,6 +81,8 @@ pub enum SourceProvider {
     TrueNas,
     Youtube,
     TikTok,
+    Iqiyi,
+    TencentVideo,
 }
 
 impl FromStr for SourceProvider {
@@ -109,6 +111,8 @@ impl FromStr for SourceProvider {
             "truenas" => Ok(Self::TrueNas),
             "youtube" => Ok(Self::Youtube),
             "tiktok" => Ok(Self::TikTok),
+            "iqiyi" => Ok(Self::Iqiyi),
+            "tencent_video" => Ok(Self::TencentVideo),
             other => Err(format!("Unknown provider type: {other}")),
         }
     }
@@ -137,6 +141,8 @@ impl SourceProvider {
         Self::TrueNas,
         Self::Youtube,
         Self::TikTok,
+        Self::Iqiyi,
+        Self::TencentVideo,
     ];
 
     #[must_use]
@@ -163,6 +169,8 @@ impl SourceProvider {
             Self::TrueNas => 19,
             Self::Youtube => 20,
             Self::TikTok => 21,
+            Self::Iqiyi => 22,
+            Self::TencentVideo => 23,
         }
     }
 
@@ -190,6 +198,8 @@ impl SourceProvider {
             Self::TrueNas => "truenas",
             Self::Youtube => "youtube",
             Self::TikTok => "tiktok",
+            Self::Iqiyi => "iqiyi",
+            Self::TencentVideo => "tencent_video",
         }
     }
 }
@@ -220,6 +230,8 @@ impl TryFrom<i16> for SourceProvider {
             19 => Ok(Self::TrueNas),
             20 => Ok(Self::Youtube),
             21 => Ok(Self::TikTok),
+            22 => Ok(Self::Iqiyi),
+            23 => Ok(Self::TencentVideo),
             other => Err(format!("Unknown provider type code: {other}")),
         }
     }
