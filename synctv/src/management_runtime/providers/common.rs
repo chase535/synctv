@@ -99,6 +99,12 @@ fn source_provider_to_proto(provider: Option<synctv_core::models::SourceProvider
         Some(synctv_core::models::SourceProvider::Youtube) => {
             source_config_proto::SourceProvider::Youtube as i32
         }
+        Some(synctv_core::models::SourceProvider::Iqiyi) => {
+            source_config_proto::SourceProvider::Iqiyi as i32
+        }
+        Some(synctv_core::models::SourceProvider::TencentVideo) => {
+            source_config_proto::SourceProvider::TencentVideo as i32
+        }
         None => source_config_proto::SourceProvider::Unspecified as i32,
     }
 }
