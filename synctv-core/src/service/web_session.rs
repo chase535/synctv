@@ -605,10 +605,10 @@ mod tests {
     #[test]
     fn playback_cache_key_does_not_embed_resource_url() {
         let request = WebSessionPlaybackRequest {
-            room_id: RoomId::from(7),
+            room_id: RoomId::expect_positive(7),
             playback_generation: 11,
             provider: WebSessionProvider::Iqiyi,
-            credential_owner_id: UserId::from(13),
+            credential_owner_id: UserId::expect_positive(13),
             resource_key: "https://www.iqiyi.com/v_abcdef.html?secretish=query".to_string(),
             resource_version: Some("episode-1".to_string()),
             paused: false,
@@ -616,7 +616,7 @@ mod tests {
         let access = WebSessionAccess {
             provider: WebSessionProvider::Iqiyi,
             server_id: WEB_SESSION_SERVER_ID.to_string(),
-            credential_owner_id: UserId::from(13),
+            credential_owner_id: UserId::expect_positive(13),
             credential_revision: "42:1700000000123456".to_string(),
             cookies: Vec::new(),
         };
