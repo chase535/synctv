@@ -25,7 +25,7 @@ jobs:
       - name: Format and compile HTTP API
         run: |
           cargo fmt --all
-          cargo check -p synctv-api-http --all-features
+          cargo check -p synctv-api-http
       - name: Commit implementation and remove helper files
         run: |
           git rm .github/workflows/feature-web-session-http.yml tool/feature_web_session_http_patch.py
