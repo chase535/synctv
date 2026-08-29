@@ -257,7 +257,7 @@ impl ProviderCommonService for ProviderCommonGrpcService {
                             .collect();
                         let binding = web_session_service
                             .bind(CoreBindWebSessionRequest {
-                                user_id: validated.user_id,
+                                user_id: validated.user_id(),
                                 provider,
                                 label: req.label,
                                 cookies,
@@ -294,7 +294,7 @@ impl ProviderCommonService for ProviderCommonGrpcService {
                     async move {
                         validate_proto_request(&req)?;
                         let bindings = web_session_service
-                            .list(validated.user_id)
+                            .list(validated.user_id())
                             .await
                             .map_err(ApiError::from)?
                             .into_iter()
@@ -329,7 +329,7 @@ impl ProviderCommonService for ProviderCommonGrpcService {
                         validate_proto_request(&req)?;
                         let provider = web_session_provider_from_proto(req.provider)?;
                         let removed = web_session_service
-                            .unbind(validated.user_id, provider)
+                            .unbind(validated.user_id(), provider)
                             .await
                             .map_err(ApiError::from)?;
                         Ok(UnbindWebSessionResponse { removed })
