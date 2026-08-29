@@ -304,6 +304,25 @@ impl UserProviderCredential {
     }
 }
 
+/// Structured cookie captured from an isolated provider login WebView.
+///
+/// The provider row identifies which media service owns the session. Keeping the
+/// cookie shape generic lets iQiyi, Tencent Video, and future web-session based
+/// providers share one encrypted credential representation without sharing the
+/// actual session with room members.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderWebSessionCookie {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    pub path: String,
+    pub secure: bool,
+    pub http_only: bool,
+    pub session_only: bool,
+    pub expires_at: Option<i64>,
+}
+
 /// Media Provider Credential Types
 ///
 /// Enum representing different credential formats for supported media providers.
@@ -317,6 +336,14 @@ pub enum ProviderCredential {
     #[serde(rename = "bilibili")]
     /// Bilibili credentials (cookies)
     Bilibili { cookies: HashMap<String, String> },
+
+    #[serde(rename = "webSession")]
+    /// Generic browser session used by providers such as iQiyi and Tencent Video.
+    /// Cookie values are encrypted by the repository before persistence.
+    WebSession {
+        label: String,
+        cookies: Vec<ProviderWebSessionCookie>,
+    },
 
     #[serde(rename = "alist")]
     /// Alist credentials (username/password)
@@ -597,6 +624,24 @@ mod tests {
         let bilibili = ProviderCredential::Bilibili { cookies };
         assert!(matches!(bilibili, ProviderCredential::Bilibili { .. }));
 
+        let web_session = ProviderCredential::WebSession {
+            label: "room account".to_string(),
+            cookies: vec![ProviderWebSessionCookie {
+                name: "session".to_string(),
+                value: "secret".to_string(),
+                domain: ".iqiyi.com".to_string(),
+                path: "/".to_string(),
+                secure: true,
+                http_only: true,
+                session_only: true,
+                expires_at: None,
+            }],
+        };
+        assert!(matches!(
+            web_session,
+            ProviderCredential::WebSession { .. }
+        ));
+
         let alist = ProviderCredential::Alist {
             host: "https://alist.example.com".to_string(),
             username: "admin".to_string(),
@@ -611,6 +656,37 @@ mod tests {
             emby_user_id: "user_uuid".to_string(),
         };
         assert!(matches!(emby, ProviderCredential::Emby { .. }));
+    }
+
+    #[test]
+    fn provider_web_session_credential_round_trips_structured_cookies() {
+        let credential = ProviderCredential::WebSession {
+            label: "owner account".to_string(),
+            cookies: vec![ProviderWebSessionCookie {
+                name: "auth".to_string(),
+                value: "opaque-secret".to_string(),
+                domain: "v.qq.com".to_string(),
+                path: "/x/".to_string(),
+                secure: true,
+                http_only: true,
+                session_only: false,
+                expires_at: Some(2_000_000_000),
+            }],
+        };
+
+        let value = serde_json::to_value(&credential).expect("serialize web session credential");
+        assert_eq!(value["type"], "webSession");
+        assert_eq!(value["cookies"][0]["domain"], "v.qq.com");
+        assert_eq!(value["cookies"][0]["expiresAt"], 2_000_000_000_i64);
+
+        let decoded: ProviderCredential =
+            serde_json::from_value(value).expect("deserialize web session credential");
+        let ProviderCredential::WebSession { label, cookies } = decoded else {
+            panic!("expected web session credential");
+        };
+        assert_eq!(label, "owner account");
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].value, "opaque-secret");
     }
 
     #[test]
