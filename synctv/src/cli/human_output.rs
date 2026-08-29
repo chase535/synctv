@@ -2784,9 +2784,7 @@ fn humanize_source_provider(raw: i32) -> String {
         Ok(synctv_proto::source_config::SourceProvider::Truenas) => "truenas".to_string(),
         Ok(synctv_proto::source_config::SourceProvider::Youtube) => "youtube".to_string(),
         Ok(synctv_proto::source_config::SourceProvider::Iqiyi) => "iqiyi".to_string(),
-        Ok(synctv_proto::source_config::SourceProvider::TencentVideo) => {
-            "tencentVideo".to_string()
-        }
+        Ok(synctv_proto::source_config::SourceProvider::TencentVideo) => "tencentVideo".to_string(),
         Err(_) => raw.to_string(),
     }
 }
