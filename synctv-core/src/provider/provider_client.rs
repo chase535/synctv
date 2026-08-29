@@ -4,7 +4,11 @@
 //! statics. Remote provider adapters live with the remote transport code so
 //! gRPC wire concerns stay grouped behind this facade.
 
-use super::ProviderError;
+pub(crate) use super::{
+    require_compatible_playback_route, MediaProvider, PlaybackInfo, PlaybackProxyAutoPolicy,
+    PlaybackProxyAutoReason, PlaybackProxyPolicy, PlaybackResult, ProviderContext,
+    ProviderCredentialDependency, ProviderCredentialPolicy, ProviderError, SourceConfig,
+};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
@@ -16,6 +20,8 @@ use synctv_media_providers::remote_transport::RemoteProviderConnection;
 pub(crate) use synctv_media_providers::remote_transport::{
     create_remote_alist_client, create_remote_bilibili_client, create_remote_emby_client,
 };
+
+pub(crate) mod web_session_video;
 
 #[cfg(test)]
 static PROVIDER_CLIENT_MANAGER_MARKER_SEQ: AtomicUsize = AtomicUsize::new(1);
