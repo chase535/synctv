@@ -227,8 +227,8 @@ pub use provider_instance::{
     normalize_provider_instance_name_owned, resolve_provider_instance_binding,
     validate_provider_instance_name, CredentialProviderInstanceName, NewProviderInstance,
     ProviderCredential, ProviderInstance, ProviderInstanceBindingMismatch,
-    ProviderInstanceListQuery, ProviderInstanceListSortBy, SynologyApiBinding,
-    UserProviderCredential,
+    ProviderInstanceListQuery, ProviderInstanceListSortBy, ProviderWebSessionCookie,
+    SynologyApiBinding, UserProviderCredential,
 };
 pub use provider_target::{
     hash_empty_provider_target, hash_optional_provider_target, AlistTarget, BilibiliTarget,
