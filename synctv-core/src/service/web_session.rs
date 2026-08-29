@@ -5,9 +5,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use synctv_media_providers::{
-    web_session::SessionCookie, IqiyiClient, TencentVideoClient,
-};
+use synctv_media_providers::{web_session::SessionCookie, IqiyiClient, TencentVideoClient};
 
 use crate::{
     models::{
@@ -92,6 +90,114 @@ pub(crate) struct WebSessionAccess {
     pub cookies: Vec<SessionCookie>,
 }
 
+fn cookie_payload_bytes(cookies: &[ProviderWebSessionCookie]) -> usize {
+    cookies.iter().fold(0usize, |total, cookie| {
+        total
+            .saturating_add(cookie.name.len())
+            .saturating_add(cookie.value.len())
+            .saturating_add(cookie.domain.len())
+            .saturating_add(cookie.path.len())
+    })
+}
+
+fn session_cookies(cookies: &[ProviderWebSessionCookie]) -> Vec<SessionCookie> {
+    cookies
+        .iter()
+        .map(|cookie| SessionCookie {
+            name: cookie.name.clone(),
+            value: cookie.value.clone(),
+            domain: cookie.domain.clone(),
+            path: cookie.path.clone(),
+            secure: cookie.secure,
+            http_only: cookie.http_only,
+            session_only: cookie.session_only,
+            expires_at: cookie.expires_at,
+        })
+        .collect()
+}
+
+fn validate_web_session_cookies(
+    http_client: &reqwest::Client,
+    provider: WebSessionProvider,
+    cookies: &[ProviderWebSessionCookie],
+) -> Result<Vec<SessionCookie>> {
+    if cookies.is_empty() {
+        return Err(Error::InvalidInput(
+            "provider web-session must contain at least one cookie".to_string(),
+        ));
+    }
+    if cookies.len() > MAX_WEB_SESSION_COOKIES {
+        return Err(Error::InvalidInput(format!(
+            "provider web-session exceeds {MAX_WEB_SESSION_COOKIES} cookies"
+        )));
+    }
+    if cookie_payload_bytes(cookies) > MAX_WEB_SESSION_COOKIE_BYTES {
+        return Err(Error::InvalidInput(format!(
+            "provider web-session cookie payload exceeds {MAX_WEB_SESSION_COOKIE_BYTES} bytes"
+        )));
+    }
+
+    let cookies = session_cookies(cookies);
+    let result = match provider {
+        WebSessionProvider::Iqiyi => IqiyiClient::new(http_client.clone(), cookies.clone()).map(|_| ()),
+        WebSessionProvider::TencentVideo => {
+            TencentVideoClient::new(http_client.clone(), cookies.clone()).map(|_| ())
+        }
+    };
+    result.map_err(|error| {
+        Error::InvalidInput(format!(
+            "invalid {} web-session cookies: {error}",
+            provider.as_str()
+        ))
+    })?;
+    Ok(cookies)
+}
+
+pub(crate) async fn load_web_session_access(
+    credential_repo: &UserProviderCredentialRepository,
+    http_client: &reqwest::Client,
+    user_id: UserId,
+    provider: WebSessionProvider,
+) -> Result<WebSessionAccess> {
+    let credential = credential_repo
+        .get_by_provider_and_server(user_id, provider.as_str(), WEB_SESSION_SERVER_ID)
+        .await?
+        .ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "{} web-session login is required",
+                provider.as_str()
+            ))
+        })?;
+    if credential.is_expired() {
+        return Err(Error::InvalidInput(format!(
+            "{} web-session credential has expired",
+            provider.as_str()
+        )));
+    }
+    if credential.provider != provider.as_str() || credential.server_id != WEB_SESSION_SERVER_ID {
+        return Err(Error::InvalidInput(
+            "provider web-session credential identity mismatch".to_string(),
+        ));
+    }
+
+    let revision = credential_revision(credential.id, credential.updated_at);
+    let ProviderCredential::WebSession { cookies, .. } = credential.credential_data else {
+        return Err(Error::InvalidInput(format!(
+            "{} credential is not a web-session credential",
+            provider.as_str()
+        )));
+    };
+    let cookies = validate_web_session_cookies(http_client, provider, &cookies)?;
+
+    Ok(WebSessionAccess {
+        provider,
+        server_id: credential.server_id,
+        credential_owner_id: user_id,
+        credential_revision: revision,
+        cookies,
+    })
+}
+
 #[derive(Clone)]
 pub struct WebSessionCredentialService {
     credential_repo: Arc<UserProviderCredentialRepository>,
@@ -125,70 +231,6 @@ impl WebSessionCredentialService {
         Ok(label.to_string())
     }
 
-    fn cookie_payload_bytes(cookies: &[ProviderWebSessionCookie]) -> usize {
-        cookies.iter().fold(0usize, |total, cookie| {
-            total
-                .saturating_add(cookie.name.len())
-                .saturating_add(cookie.value.len())
-                .saturating_add(cookie.domain.len())
-                .saturating_add(cookie.path.len())
-        })
-    }
-
-    fn session_cookies(cookies: &[ProviderWebSessionCookie]) -> Vec<SessionCookie> {
-        cookies
-            .iter()
-            .map(|cookie| SessionCookie {
-                name: cookie.name.clone(),
-                value: cookie.value.clone(),
-                domain: cookie.domain.clone(),
-                path: cookie.path.clone(),
-                secure: cookie.secure,
-                http_only: cookie.http_only,
-                session_only: cookie.session_only,
-                expires_at: cookie.expires_at,
-            })
-            .collect()
-    }
-
-    fn validate_cookies(
-        &self,
-        provider: WebSessionProvider,
-        cookies: &[ProviderWebSessionCookie],
-    ) -> Result<()> {
-        if cookies.is_empty() {
-            return Err(Error::InvalidInput(
-                "provider web-session must contain at least one cookie".to_string(),
-            ));
-        }
-        if cookies.len() > MAX_WEB_SESSION_COOKIES {
-            return Err(Error::InvalidInput(format!(
-                "provider web-session exceeds {MAX_WEB_SESSION_COOKIES} cookies"
-            )));
-        }
-        if Self::cookie_payload_bytes(cookies) > MAX_WEB_SESSION_COOKIE_BYTES {
-            return Err(Error::InvalidInput(format!(
-                "provider web-session cookie payload exceeds {MAX_WEB_SESSION_COOKIE_BYTES} bytes"
-            )));
-        }
-
-        let cookies = Self::session_cookies(cookies);
-        let result = match provider {
-            WebSessionProvider::Iqiyi => {
-                IqiyiClient::new(self.http_client.clone(), cookies).map(|_| ())
-            }
-            WebSessionProvider::TencentVideo => {
-                TencentVideoClient::new(self.http_client.clone(), cookies).map(|_| ())
-            }
-        };
-        result.map_err(|error| {
-            Error::InvalidInput(format!(
-                "invalid {} web-session cookies: {error}",
-                provider.as_str()
-            ))
-        })
-    }
-
     fn binding_from_credential(
         provider: WebSessionProvider,
         credential: UserProviderCredential,
@@ -218,7 +260,7 @@ impl WebSessionCredentialService {
     }
 
     pub async fn bind(&self, request: BindWebSessionRequest) -> Result<WebSessionBinding> {
-        self.validate_cookies(request.provider, &request.cookies)?;
+        validate_web_session_cookies(&self.http_client, request.provider, &request.cookies)?;
         let label = Self::normalize_label(request.provider, &request.label)?;
 
         if let Some(existing) = self
@@ -275,51 +317,6 @@ impl WebSessionCredentialService {
         Ok(bindings)
     }
 
-    pub(crate) async fn access(
-        &self,
-        user_id: UserId,
-        provider: WebSessionProvider,
-    ) -> Result<WebSessionAccess> {
-        let credential = self
-            .credential_repo
-            .get_by_provider_and_server(user_id, provider.as_str(), WEB_SESSION_SERVER_ID)
-            .await?
-            .ok_or_else(|| {
-                Error::InvalidInput(format!(
-                    "{} web-session login is required",
-                    provider.as_str()
-                ))
-            })?;
-        if credential.is_expired() {
-            return Err(Error::InvalidInput(format!(
-                "{} web-session credential has expired",
-                provider.as_str()
-            )));
-        }
-        if credential.provider != provider.as_str() || credential.server_id != WEB_SESSION_SERVER_ID {
-            return Err(Error::InvalidInput(
-                "provider web-session credential identity mismatch".to_string(),
-            ));
-        }
-
-        let revision = credential_revision(credential.id, credential.updated_at);
-        let ProviderCredential::WebSession { cookies, .. } = credential.credential_data else {
-            return Err(Error::InvalidInput(format!(
-                "{} credential is not a web-session credential",
-                provider.as_str()
-            )));
-        };
-        self.validate_cookies(provider, &cookies)?;
-
-        Ok(WebSessionAccess {
-            provider,
-            server_id: credential.server_id,
-            credential_owner_id: user_id,
-            credential_revision: revision,
-            cookies: Self::session_cookies(&cookies),
-        })
-    }
-
     pub async fn unbind(&self, user_id: UserId, provider: WebSessionProvider) -> Result<bool> {
         let Some(credential) = self
             .credential_repo
@@ -365,19 +362,16 @@ pub(crate) struct WebSessionResolvedPlayback<T> {
 /// and are never stored by this coordinator.
 #[derive(Clone)]
 pub(crate) struct WebSessionPlaybackCoordinator {
-    credential_service: Arc<WebSessionCredentialService>,
     playback_sessions: Arc<ProviderPlaybackSessionRepository>,
     store: Arc<dyn ProviderStore>,
 }
 
 impl WebSessionPlaybackCoordinator {
     pub(crate) fn new(
-        credential_service: Arc<WebSessionCredentialService>,
         playback_sessions: Arc<ProviderPlaybackSessionRepository>,
         store: Arc<dyn ProviderStore>,
     ) -> Self {
         Self {
-            credential_service,
             playback_sessions,
             store,
         }
@@ -463,10 +457,11 @@ impl WebSessionPlaybackCoordinator {
     pub(crate) async fn resolve<T, F, Fut>(
         &self,
         request: WebSessionPlaybackRequest,
+        access: WebSessionAccess,
         resolver: F,
     ) -> Result<T>
     where
-        T: Clone + Serialize + DeserializeOwned + Send + Sync,
+        T: Serialize + DeserializeOwned + Send + Sync,
         F: FnOnce(WebSessionAccess) -> Fut + Send,
         Fut: Future<Output = Result<WebSessionResolvedPlayback<T>>> + Send,
     {
@@ -480,11 +475,6 @@ impl WebSessionPlaybackCoordinator {
                 "web-session playback resource key is required".to_string(),
             ));
         }
-
-        let access = self
-            .credential_service
-            .access(request.credential_owner_id, request.provider)
-            .await?;
         if access.provider != request.provider
             || access.credential_owner_id != request.credential_owner_id
         {
@@ -573,7 +563,7 @@ mod tests {
     fn cookie_payload_accounting_includes_secret_values() {
         let cookies = vec![cookie("iqiyi.com")];
         assert_eq!(
-            WebSessionCredentialService::cookie_payload_bytes(&cookies),
+            cookie_payload_bytes(&cookies),
             "session".len() + "secret".len() + "iqiyi.com".len() + "/".len()
         );
     }
@@ -598,8 +588,12 @@ mod tests {
     #[test]
     fn provider_client_rejects_foreign_cookie_domains() {
         let client = reqwest::Client::new();
-        let cookies = WebSessionCredentialService::session_cookies(&[cookie("example.com")]);
-        assert!(IqiyiClient::new(client, cookies).is_err());
+        assert!(validate_web_session_cookies(
+            &client,
+            WebSessionProvider::Iqiyi,
+            &[cookie("example.com")],
+        )
+        .is_err());
     }
 
     #[test]
