@@ -9,7 +9,7 @@ use crate::credential_encryption::CredentialEncryption;
 use crate::models::{MediaId, PlaylistId, RoomId, UserId};
 use crate::repository::UserProviderCredentialRepository;
 
-use super::{PlaybackClientProfile, ProviderAccessService};
+use super::{PlaybackClientProfile, ProviderAccessService, ProviderError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderActor {
@@ -263,6 +263,23 @@ impl<'a> ProviderContext<'a> {
         }
     }
 
+    /// Resolve the credential subject for a provider operation.
+    ///
+    /// Shared room resources use the resource owner's server-side credential;
+    /// non-shared resources use the requesting viewer's credential. Setting
+    /// [required] rejects a request that cannot resolve the selected subject.
+    pub fn resolve_credential_user_id(
+        &self,
+        policy: ProviderCredentialPolicy,
+        required: bool,
+    ) -> Result<Option<UserId>, ProviderError> {
+        let selected = self.selected_credential_user_id(policy);
+        if required && selected.is_none() {
+            return Err(ProviderError::CredentialRequired);
+        }
+        Ok(selected)
+    }
+
     #[must_use]
     pub const fn room_id(&self) -> Option<&RoomId> {
         self.room_id.as_ref()
@@ -366,6 +383,36 @@ mod tests {
         assert_eq!(
             system.selected_credential_user_id(ProviderCredentialPolicy::ResourceOwner),
             Some(creator_id)
+        );
+    }
+
+    #[test]
+    fn required_shared_credentials_resolve_to_resource_owner() {
+        let viewer_id = UserId::expect_positive(21);
+        let owner_id = UserId::expect_positive(22);
+        let ctx = ProviderContext::new("test", ProviderActor::User(viewer_id))
+            .with_credential_owner_id(owner_id);
+
+        assert_eq!(
+            ctx.resolve_credential_user_id(ProviderCredentialPolicy::ResourceOwner, true)
+                .expect("shared owner credential"),
+            Some(owner_id)
+        );
+        assert_eq!(
+            ctx.resolve_credential_user_id(ProviderCredentialPolicy::Viewer, true)
+                .expect("viewer credential"),
+            Some(viewer_id)
+        );
+    }
+
+    #[test]
+    fn required_shared_credentials_fail_without_resource_owner() {
+        let viewer_id = UserId::expect_positive(23);
+        let ctx = ProviderContext::new("test", ProviderActor::User(viewer_id));
+
+        assert!(
+            ctx.resolve_credential_user_id(ProviderCredentialPolicy::ResourceOwner, true)
+                .is_err()
         );
     }
 }
