@@ -54,6 +54,20 @@ pub fn media_source_config_from_proto(
                 shared: config.shared,
             },
         ),
+        Provider::Iqiyi(config) => synctv_core::models::MediaSourceConfig::Iqiyi(
+            synctv_core::models::IqiyiMediaSourceConfig {
+                url: config.url,
+                shared: config.shared,
+                proxy_mode: playback_proxy_mode_from_proto(config.proxy_mode)?,
+            },
+        ),
+        Provider::TencentVideo(config) => synctv_core::models::MediaSourceConfig::TencentVideo(
+            synctv_core::models::TencentVideoMediaSourceConfig {
+                url: config.url,
+                shared: config.shared,
+                proxy_mode: playback_proxy_mode_from_proto(config.proxy_mode)?,
+            },
+        ),
         Provider::Huya(config) => synctv_core::models::MediaSourceConfig::Huya(
             huya_media_source_config_from_proto(config)?,
         ),
