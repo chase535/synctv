@@ -2,7 +2,9 @@ syntax = "proto3";
 
 package synctv.provider.common;
 
+import "proto/buf/validate/validate.proto";
 import "proto/providers/common.proto";
+import "proto/source_config.proto";
 
 service ProviderCommonService {
   rpc PrepareDirectUrl(PrepareDirectUrlRequest) returns (PreparedMediaSource);
@@ -21,4 +23,66 @@ service ProviderCommonService {
   rpc BindWebSession(BindWebSessionRequest) returns (BindWebSessionResponse);
   rpc ListWebSessions(ListWebSessionsRequest) returns (ListWebSessionsResponse);
   rpc UnbindWebSession(UnbindWebSessionRequest) returns (UnbindWebSessionResponse);
+}
+
+// Browser cookies are accepted only when binding a provider session. The server
+// never includes this message in a list/binding response.
+message WebSessionCookie {
+  string name = 1 [(buf.validate.field).string.min_len = 1];
+  string value = 2;
+  string domain = 3 [(buf.validate.field).string.min_len = 1];
+  string path = 4;
+  bool secure = 5;
+  bool http_only = 6;
+  bool session_only = 7;
+  optional int64 expires_at = 8;
+}
+
+message BindWebSessionRequest {
+  synctv.source_config.SourceProvider provider = 1 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  string label = 2 [(buf.validate.field).string.max_len = 128];
+  repeated WebSessionCookie cookies = 3 [(buf.validate.field).repeated = {
+    min_items: 1
+    max_items: 256
+  }];
+}
+
+message BindWebSessionResponse {
+  WebSessionBinding binding = 1 [(buf.validate.field).required = true];
+}
+
+message ListWebSessionsRequest {}
+
+message ListWebSessionsResponse {
+  repeated WebSessionBinding bindings = 1;
+}
+
+message UnbindWebSessionRequest {
+  synctv.source_config.SourceProvider provider = 1 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+}
+
+message UnbindWebSessionResponse {
+  bool removed = 1;
+}
+
+// Safe binding metadata. Cookie values and other authentication material are
+// intentionally absent from this message.
+message WebSessionBinding {
+  int64 credential_id = 1;
+  synctv.source_config.SourceProvider provider = 2 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  string server_id = 3;
+  string label = 4;
+  uint32 cookie_count = 5;
+  optional int64 expires_at = 6;
+  int64 created_at = 7;
+  int64 updated_at = 8;
 }
