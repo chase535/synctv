@@ -216,7 +216,7 @@ pub use playback::{
 pub use playback_session::{
     EmbyPlaybackSession, FnosPlaybackSession, ProviderPlaybackSession,
     ProviderPlaybackSessionRecord, ProviderPlaybackSessionState, ProviderPlaybackStopReason,
-    SynologyPlaybackSession,
+    SynologyPlaybackSession, WebSessionPlaybackSession,
 };
 pub use playlist::{
     CreatePlaylistRequest, Playlist, PlaylistBrowseAccessMode, PlaylistListQuery,
@@ -408,6 +408,8 @@ mod tests {
             (SourceProvider::TrueNas, 19, "truenas"),
             (SourceProvider::Youtube, 20, "youtube"),
             (SourceProvider::TikTok, 21, "tiktok"),
+            (SourceProvider::Iqiyi, 22, "iqiyi"),
+            (SourceProvider::TencentVideo, 23, "tencent_video"),
         ];
 
         assert_eq!(SourceProvider::ALL.len(), PROVIDERS.len());
