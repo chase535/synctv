@@ -80,7 +80,7 @@ pub struct ProviderContext<'a> {
     /// Provider store for caching and distributed locking (optional)
     pub store: Option<Arc<dyn super::store::ProviderStore>>,
 
-    /// Repository required by credential-backed providers.
+    /// Repository required by credential-backed provider resolution.
     pub credential_repo: Option<&'a UserProviderCredentialRepository>,
 
     /// Typed provider access service for cached credential/session resolution.
@@ -267,7 +267,7 @@ impl<'a> ProviderContext<'a> {
     ///
     /// Shared room resources use the resource owner's server-side credential;
     /// non-shared resources use the requesting viewer's credential. Setting
-    /// [required] rejects a request that cannot resolve the selected subject.
+    /// `required` rejects a request that cannot resolve the selected subject.
     pub fn resolve_credential_user_id(
         &self,
         policy: ProviderCredentialPolicy,
