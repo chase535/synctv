@@ -264,7 +264,7 @@ impl ProviderCommonService for ProviderCommonGrpcService {
                             })
                             .await
                             .map_err(ApiError::from)?;
-                        Ok(BindWebSessionResponse {
+                        Ok::<_, ApiError>(BindWebSessionResponse {
                             binding: Some(web_session_binding_to_proto(binding)?),
                         })
                     }
@@ -300,7 +300,7 @@ impl ProviderCommonService for ProviderCommonGrpcService {
                             .into_iter()
                             .map(web_session_binding_to_proto)
                             .collect::<Result<Vec<_>, _>>()?;
-                        Ok(ListWebSessionsResponse { bindings })
+                        Ok::<_, ApiError>(ListWebSessionsResponse { bindings })
                     }
                 },
             )
@@ -332,7 +332,7 @@ impl ProviderCommonService for ProviderCommonGrpcService {
                             .unbind(validated.user_id(), provider)
                             .await
                             .map_err(ApiError::from)?;
-                        Ok(UnbindWebSessionResponse { removed })
+                        Ok::<_, ApiError>(UnbindWebSessionResponse { removed })
                     }
                 },
             )
