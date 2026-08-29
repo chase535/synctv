@@ -8,6 +8,7 @@ use synctv_media_providers::{
 
 use crate::{
     models::{ProviderCredential, ProviderWebSessionCookie, UserId, UserProviderCredential},
+    provider::credential_resolver::credential_revision,
     repository::UserProviderCredentialRepository,
     Error, Result,
 };
@@ -63,6 +64,19 @@ pub struct WebSessionBinding {
     pub expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Server-internal authenticated browser session.
+///
+/// This type intentionally does not implement `Serialize` or `Debug`: cookie
+/// values must never cross an API boundary or be emitted by structured logs.
+#[derive(Clone)]
+pub struct WebSessionAccess {
+    pub provider: WebSessionProvider,
+    pub server_id: String,
+    pub credential_owner_id: UserId,
+    pub credential_revision: String,
+    pub cookies: Vec<SessionCookie>,
 }
 
 #[derive(Clone)]
@@ -246,6 +260,51 @@ impl WebSessionCredentialService {
             bindings.push(Self::binding_from_credential(provider, credential)?);
         }
         Ok(bindings)
+    }
+
+    pub async fn access(
+        &self,
+        user_id: UserId,
+        provider: WebSessionProvider,
+    ) -> Result<WebSessionAccess> {
+        let credential = self
+            .credential_repo
+            .get_by_provider_and_server(user_id, provider.as_str(), WEB_SESSION_SERVER_ID)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "{} web-session login is required",
+                    provider.as_str()
+                ))
+            })?;
+        if credential.is_expired() {
+            return Err(Error::InvalidInput(format!(
+                "{} web-session credential has expired",
+                provider.as_str()
+            )));
+        }
+        if credential.provider != provider.as_str() || credential.server_id != WEB_SESSION_SERVER_ID {
+            return Err(Error::InvalidInput(
+                "provider web-session credential identity mismatch".to_string(),
+            ));
+        }
+
+        let revision = credential_revision(credential.id, credential.updated_at);
+        let ProviderCredential::WebSession { cookies, .. } = credential.credential_data else {
+            return Err(Error::InvalidInput(format!(
+                "{} credential is not a web-session credential",
+                provider.as_str()
+            )));
+        };
+        self.validate_cookies(provider, &cookies)?;
+
+        Ok(WebSessionAccess {
+            provider,
+            server_id: credential.server_id,
+            credential_owner_id: user_id,
+            credential_revision: revision,
+            cookies: Self::session_cookies(&cookies),
+        })
     }
 
     pub async fn unbind(&self, user_id: UserId, provider: WebSessionProvider) -> Result<bool> {
