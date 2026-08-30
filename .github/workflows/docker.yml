@@ -176,7 +176,6 @@ jobs:
 
   publish-image-digest:
     name: Publish image digest
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: docker-build
     runs-on: ubuntu-24.04
     permissions:
