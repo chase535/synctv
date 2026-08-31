@@ -102,26 +102,22 @@ pub async fn render_web_page_playback(
     let raw_url = raw_url.to_string();
     let cookies = cookies.to_vec();
 
-    tokio::time::timeout(BROWSER_RENDER_TIMEOUT, async move {
-        browser_render_cache()
-            .try_get_with(cache_key, async move {
-                let _permit = BROWSER_RENDER_SEMAPHORE.acquire().await.map_err(|error| {
-                    ProviderClientError::Network(format!(
-                        "browser discovery semaphore closed: {error}"
-                    ))
-                })?;
-                render_web_page_playback_inner(&raw_url, allowed_domains, &cookies).await
-            })
-            .await
-            .map_err(|error| clone_provider_client_error(error.as_ref()))
-    })
-    .await
-    .map_err(|_| {
-        ProviderClientError::Network(format!(
-            "browser page rendering timed out after {}s",
-            BROWSER_RENDER_TIMEOUT.as_secs()
-        ))
-    })?
+    let initializer = Box::pin(async move {
+        let _permit = BROWSER_RENDER_SEMAPHORE.acquire().await.map_err(|error| {
+            ProviderClientError::Network(format!("browser discovery semaphore closed: {error}"))
+        })?;
+        render_web_page_playback_inner(&raw_url, allowed_domains, &cookies).await
+    });
+    let render = Box::pin(browser_render_cache().try_get_with(cache_key, initializer));
+    let result = tokio::time::timeout(BROWSER_RENDER_TIMEOUT, render)
+        .await
+        .map_err(|_| {
+            ProviderClientError::Network(format!(
+                "browser page rendering timed out after {}s",
+                BROWSER_RENDER_TIMEOUT.as_secs()
+            ))
+        })?;
+    result.map_err(|error| clone_provider_client_error(error.as_ref()))
 }
 
 fn browser_render_cache() -> &'static Cache<String, BrowserPageObservation> {
@@ -778,8 +774,13 @@ mod tests {
             expires_at: None,
         };
         let url = "https://www.iqiyi.com/v_demo.html";
-        let forward = browser_render_cache_key(url, &["iqiyi.com", "qiyi.com"], &[first.clone(), second.clone()]);
-        let reversed = browser_render_cache_key(url, &["qiyi.com", "iqiyi.com"], &[second, first.clone()]);
+        let forward = browser_render_cache_key(
+            url,
+            &["iqiyi.com", "qiyi.com"],
+            &[first.clone(), second.clone()],
+        );
+        let reversed =
+            browser_render_cache_key(url, &["qiyi.com", "iqiyi.com"], &[second, first.clone()]);
         assert_eq!(forward, reversed);
 
         let mut changed = first;
