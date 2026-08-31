@@ -1,7 +1,7 @@
 use crate::web_session::{ScopedWebSessionClient, SessionCookie, WebPagePlaybackDiscovery};
 use crate::ProviderClientError;
 
-pub const IQIYI_SESSION_DOMAINS: &[&str] = &["iqiyi.com"];
+pub const IQIYI_SESSION_DOMAINS: &[&str] = &["iqiyi.com", "qiyi.com"];
 
 #[derive(Clone)]
 pub struct IqiyiClient {
