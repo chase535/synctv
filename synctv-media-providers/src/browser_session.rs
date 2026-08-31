@@ -25,8 +25,7 @@ const PAGE_READY_POLL_ATTEMPTS: usize = 40;
 const PAGE_SETTLE_DELAY: Duration = Duration::from_secs(3);
 const MAX_CONCURRENT_BROWSER_RENDERS: usize = 2;
 
-static BROWSER_RENDER_SEMAPHORE: Semaphore =
-    Semaphore::const_new(MAX_CONCURRENT_BROWSER_RENDERS);
+static BROWSER_RENDER_SEMAPHORE: Semaphore = Semaphore::const_new(MAX_CONCURRENT_BROWSER_RENDERS);
 
 type CdpSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -115,20 +114,22 @@ async fn render_web_page_playback_inner(
     cookies: &[SessionCookie],
 ) -> Result<BrowserPageObservation, ProviderClientError> {
     let page_url = validate_provider_url(raw_url, allowed_domains)?;
-    let profile_dir = std::env::temp_dir().join(format!(
-        "synctv-chromium-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
+    let profile_dir =
+        std::env::temp_dir().join(format!("synctv-chromium-{}", uuid::Uuid::new_v4().simple()));
     tokio::fs::create_dir_all(&profile_dir)
         .await
-        .map_err(|error| ProviderClientError::Network(format!("create browser profile: {error}")))?;
+        .map_err(|error| {
+            ProviderClientError::Network(format!("create browser profile: {error}"))
+        })?;
 
     let (mut browser, debugger_url) = start_chromium(&profile_dir).await?;
     let result = async {
         let target_ws_url = find_page_target(&debugger_url).await?;
         let (mut socket, _) = connect_async(target_ws_url.as_str())
             .await
-            .map_err(|error| ProviderClientError::Network(format!("connect browser CDP: {error}")))?;
+            .map_err(|error| {
+                ProviderClientError::Network(format!("connect browser CDP: {error}"))
+            })?;
         let mut command_id = 0_u64;
 
         cdp_call(&mut socket, &mut command_id, "Network.enable", json!({})).await?;
@@ -202,7 +203,8 @@ async fn render_web_page_playback_inner(
 async fn start_chromium(
     profile_dir: &Path,
 ) -> Result<(ChromiumProcess, String), ProviderClientError> {
-    let chromium_bin = std::env::var("SYNCTV_CHROMIUM_BIN").unwrap_or_else(|_| "chromium".to_string());
+    let chromium_bin =
+        std::env::var("SYNCTV_CHROMIUM_BIN").unwrap_or_else(|_| "chromium".to_string());
     let mut command = Command::new(chromium_bin);
     command
         .arg("--headless=new")
@@ -219,9 +221,7 @@ async fn start_chromium(
         .arg("--remote-allow-origins=*")
         .arg("--remote-debugging-address=127.0.0.1")
         .arg("--remote-debugging-port=0")
-        .arg(format!(
-            "--user-agent={PROVIDER_DESKTOP_WEB_USER_AGENT}"
-        ))
+        .arg(format!("--user-agent={PROVIDER_DESKTOP_WEB_USER_AGENT}"))
         .arg(format!("--user-data-dir={}", profile_dir.display()))
         .arg("about:blank")
         .stdin(Stdio::null())
@@ -241,7 +241,9 @@ async fn start_chromium(
             let line = lines
                 .next_line()
                 .await
-                .map_err(|error| ProviderClientError::Network(format!("read Chromium startup: {error}")))?
+                .map_err(|error| {
+                    ProviderClientError::Network(format!("read Chromium startup: {error}"))
+                })?
                 .ok_or_else(|| {
                     ProviderClientError::Network(
                         "Chromium exited before exposing a DevTools endpoint".to_string(),
@@ -253,11 +255,11 @@ async fn start_chromium(
         }
     })
     .await
-    .map_err(|_| ProviderClientError::Network("Chromium DevTools startup timed out".to_string()))??;
+    .map_err(|_| {
+        ProviderClientError::Network("Chromium DevTools startup timed out".to_string())
+    })??;
 
-    tokio::spawn(async move {
-        while lines.next_line().await.ok().flatten().is_some() {}
-    });
+    tokio::spawn(async move { while lines.next_line().await.ok().flatten().is_some() {} });
 
     Ok((
         ChromiumProcess {
@@ -269,8 +271,9 @@ async fn start_chromium(
 }
 
 async fn find_page_target(debugger_url: &str) -> Result<String, ProviderClientError> {
-    let debugger = Url::parse(debugger_url)
-        .map_err(|error| ProviderClientError::Parse(format!("invalid Chromium debugger URL: {error}")))?;
+    let debugger = Url::parse(debugger_url).map_err(|error| {
+        ProviderClientError::Parse(format!("invalid Chromium debugger URL: {error}"))
+    })?;
     let port = debugger.port().ok_or_else(|| {
         ProviderClientError::Parse("Chromium debugger URL has no port".to_string())
     })?;
@@ -278,7 +281,9 @@ async fn find_page_target(debugger_url: &str) -> Result<String, ProviderClientEr
     let local_client = reqwest::Client::builder()
         .no_proxy()
         .build()
-        .map_err(|error| ProviderClientError::Network(format!("build local CDP client: {error}")))?;
+        .map_err(|error| {
+            ProviderClientError::Network(format!("build local CDP client: {error}"))
+        })?;
 
     for _ in 0..20 {
         if let Ok(response) = local_client.get(&endpoint).send().await {
@@ -316,7 +321,9 @@ async fn cdp_call(
     socket
         .send(Message::text(payload.to_string()))
         .await
-        .map_err(|error| ProviderClientError::Network(format!("send Chromium CDP command: {error}")))?;
+        .map_err(|error| {
+            ProviderClientError::Network(format!("send Chromium CDP command: {error}"))
+        })?;
 
     tokio::time::timeout(CDP_COMMAND_TIMEOUT, async {
         loop {
@@ -348,9 +355,7 @@ async fn cdp_call(
         }
     })
     .await
-    .map_err(|_| {
-        ProviderClientError::Network(format!("Chromium CDP command {method} timed out"))
-    })?
+    .map_err(|_| ProviderClientError::Network(format!("Chromium CDP command {method} timed out")))?
 }
 
 async fn wait_for_page_ready(
