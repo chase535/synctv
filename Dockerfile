@@ -115,10 +115,14 @@ LABEL org.opencontainers.image.title="SyncTV" \
     org.opencontainers.image.source="https://github.com/synctv-org/synctv" \
     org.opencontainers.image.licenses="MIT"
 
-# Install runtime dependencies (curl needed for healthcheck)
+# Install runtime dependencies. Chromium is used only as the authenticated
+# web-session fallback when static provider HTML does not expose media.
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    chromium \
     curl && rm -rf /var/lib/apt/lists/*
+
+ENV SYNCTV_CHROMIUM_BIN=/usr/bin/chromium
 
 # Create synctv for running the application
 RUN useradd -m -u 1000 synctv
@@ -138,7 +142,7 @@ COPY --from=builder /synctv /usr/local/bin/synctv
 USER synctv
 
 # Verify PATH resolution and runtime dependencies using the production user.
-RUN command -v synctv && synctv --version
+RUN command -v synctv && synctv --version && command -v chromium
 
 # Expose ports
 # 8080: HTTP API + public gRPC (also serves HLS via /api/room/movie/live/hls/*)
