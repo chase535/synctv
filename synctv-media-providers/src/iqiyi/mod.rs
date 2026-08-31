@@ -94,9 +94,7 @@ fn discover_serialized_web_media(
 
     let mut seen = discovery.media_urls.iter().cloned().collect::<HashSet<_>>();
     for matched in media_regex.find_iter(&normalized) {
-        let candidate = matched
-            .as_str()
-            .trim_end_matches([',', ';', '}', ']', ')']);
+        let candidate = matched.as_str().trim_end_matches([',', ';', '}', ']', ')']);
         let Ok(url) = Url::parse(candidate) else {
             continue;
         };
