@@ -122,8 +122,6 @@ RUN apt-get update && apt-get install -y \
     chromium \
     curl && rm -rf /var/lib/apt/lists/*
 
-ENV SYNCTV_CHROMIUM_BIN=/usr/bin/chromium
-
 # Create synctv for running the application
 RUN useradd -m -u 1000 synctv
 
