@@ -88,14 +88,22 @@ fn discover_serialized_web_media(
         .replace("\\u0026", "&")
         .replace("\\u003D", "=")
         .replace("\\u003d", "=");
-    let media_regex =
-        Regex::new(r#"(?i)https?://[^\s\"'<>\\]+?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?"#)
-            .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
+    let media_regex = Regex::new(
+        r#"(?i)(?:https?:)?//[^\s\"'<>\\]+?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?"#,
+    )
+    .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
+    let page_url = Url::parse(&discovery.page_url)
+        .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
 
     let mut seen = discovery.media_urls.iter().cloned().collect::<HashSet<_>>();
     for matched in media_regex.find_iter(&normalized) {
         let candidate = matched.as_str().trim_end_matches([',', ';', '}', ']', ')']);
-        let Ok(url) = Url::parse(candidate) else {
+        let parsed = if candidate.starts_with("//") {
+            page_url.join(candidate)
+        } else {
+            Url::parse(candidate)
+        };
+        let Ok(url) = parsed else {
             continue;
         };
         if !matches!(url.scheme(), "http" | "https") {
@@ -204,6 +212,30 @@ mod tests {
             .media_urls
             .iter()
             .any(|url| url == "https://cdn.example/movie_720p.m3u8"));
+    }
+
+    #[test]
+    fn discovers_protocol_relative_serialized_media() {
+        let mut discovery = WebPagePlaybackDiscovery {
+            page_url: "https://www.iqiyi.com/v_demo.html".to_string(),
+            title: None,
+            media_urls: Vec::new(),
+            drm_detected: false,
+        };
+        let html = r#"
+            <script>
+              window.__BOOTSTRAP__ = {
+                "media":"\/\/cdn.example\/movie_1080p.m3u8?token=abc"
+              };
+            </script>
+        "#;
+
+        discover_serialized_web_media(html, &mut discovery).expect("discover media");
+
+        assert_eq!(
+            discovery.media_urls,
+            vec!["https://cdn.example/movie_1080p.m3u8?token=abc"]
+        );
     }
 
     #[test]
