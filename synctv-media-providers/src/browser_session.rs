@@ -17,13 +17,14 @@ use url::Url;
 use crate::web_session::{SessionCookie, WebPagePlaybackDiscovery};
 use crate::{ProviderClientError, PROVIDER_DESKTOP_WEB_USER_AGENT};
 
-const BROWSER_START_TIMEOUT: Duration = Duration::from_secs(20);
-const BROWSER_RENDER_TIMEOUT: Duration = Duration::from_secs(40);
+const BROWSER_START_TIMEOUT: Duration = Duration::from_secs(10);
+const BROWSER_RENDER_TIMEOUT: Duration = Duration::from_secs(22);
+const BROWSER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const BROWSER_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
 const PAGE_READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const PAGE_READY_POLL_ATTEMPTS: usize = 40;
-const PAGE_SETTLE_DELAY: Duration = Duration::from_secs(3);
+const PAGE_READY_POLL_ATTEMPTS: usize = 20;
+const PAGE_SETTLE_DELAY: Duration = Duration::from_secs(2);
 const MAX_CONCURRENT_BROWSER_RENDERS: usize = 2;
 const MAX_BROWSER_STDERR_PREVIEW_BYTES: u64 = 4096;
 const MAX_BROWSER_STDERR_SCAN_BYTES: u64 = 16384;
@@ -91,16 +92,19 @@ pub async fn render_web_page_playback(
     allowed_domains: &'static [&'static str],
     cookies: &[SessionCookie],
 ) -> Result<BrowserPageObservation, ProviderClientError> {
-    let _permit = BROWSER_RENDER_SEMAPHORE.acquire().await.map_err(|error| {
-        ProviderClientError::Network(format!("browser discovery semaphore closed: {error}"))
-    })?;
-
-    tokio::time::timeout(
-        BROWSER_RENDER_TIMEOUT,
-        render_web_page_playback_inner(raw_url, allowed_domains, cookies),
-    )
+    tokio::time::timeout(BROWSER_RENDER_TIMEOUT, async {
+        let _permit = BROWSER_RENDER_SEMAPHORE.acquire().await.map_err(|error| {
+            ProviderClientError::Network(format!("browser discovery semaphore closed: {error}"))
+        })?;
+        render_web_page_playback_inner(raw_url, allowed_domains, cookies).await
+    })
     .await
-    .map_err(|_| ProviderClientError::Network("browser page rendering timed out".to_string()))?
+    .map_err(|_| {
+        ProviderClientError::Network(format!(
+            "browser page rendering timed out after {}s",
+            BROWSER_RENDER_TIMEOUT.as_secs()
+        ))
+    })?
 }
 
 async fn render_web_page_playback_inner(
@@ -120,11 +124,20 @@ async fn render_web_page_playback_inner(
     let (mut browser, browser_ws_url) = start_chromium(&profile_dir).await?;
     let result = async {
         let target_ws_url = find_page_target(&browser_ws_url).await?;
-        let (mut socket, _) = connect_async(target_ws_url.as_str())
-            .await
-            .map_err(|error| {
-                ProviderClientError::Network(format!("connect browser page CDP: {error}"))
-            })?;
+        let (mut socket, _) = tokio::time::timeout(
+            BROWSER_CONNECT_TIMEOUT,
+            connect_async(target_ws_url.as_str()),
+        )
+        .await
+        .map_err(|_| {
+            ProviderClientError::Network(format!(
+                "connect browser page CDP timed out after {}s",
+                BROWSER_CONNECT_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|error| {
+            ProviderClientError::Network(format!("connect browser page CDP: {error}"))
+        })?;
         let mut command_id = 0_u64;
 
         cdp_call(&mut socket, &mut command_id, "Network.enable", json!({})).await?;
@@ -341,7 +354,18 @@ fn browser_stderr_preview(path: &Path) -> String {
 }
 
 async fn find_page_target(browser_ws_url: &str) -> Result<String, ProviderClientError> {
-    let (mut browser_socket, _) = connect_async(browser_ws_url).await.map_err(|error| {
+    let (mut browser_socket, _) = tokio::time::timeout(
+        BROWSER_CONNECT_TIMEOUT,
+        connect_async(browser_ws_url),
+    )
+    .await
+    .map_err(|_| {
+        ProviderClientError::Network(format!(
+            "connect Chromium browser CDP timed out after {}s",
+            BROWSER_CONNECT_TIMEOUT.as_secs()
+        ))
+    })?
+    .map_err(|error| {
         ProviderClientError::Network(format!("connect Chromium browser CDP: {error}"))
     })?;
     let mut command_id = 0_u64;
