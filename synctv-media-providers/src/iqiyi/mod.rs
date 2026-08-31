@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use percent_encoding::percent_decode_str;
 use regex::Regex;
 use url::Url;
 
@@ -103,60 +104,96 @@ fn discover_serialized_web_media(
     html: &str,
     discovery: &mut WebPagePlaybackDiscovery,
 ) -> Result<(), ProviderClientError> {
-    // Work on a scan-only copy. JSON embedded in HTML commonly escapes URL
-    // punctuation, so normalize those textual escapes before looking for URLs.
-    // This never executes page JavaScript.
-    let decoded = html_escape::decode_html_entities(html);
-    let normalized = decoded
-        .replace("\\u003A", ":")
-        .replace("\\u003a", ":")
-        .replace("\\u002F", "/")
-        .replace("\\u002f", "/")
-        .replace("\\u002E", ".")
-        .replace("\\u002e", ".")
-        .replace("\\u003F", "?")
-        .replace("\\u003f", "?")
-        .replace("\\u0026", "&")
-        .replace("\\u003D", "=")
-        .replace("\\u003d", "=")
-        .replace("\\x3A", ":")
-        .replace("\\x3a", ":")
-        .replace("\\x2F", "/")
-        .replace("\\x2f", "/")
-        .replace("\\x2E", ".")
-        .replace("\\x2e", ".")
-        .replace("\\x3F", "?")
-        .replace("\\x3f", "?")
-        .replace("\\x26", "&")
-        .replace("\\x3D", "=")
-        .replace("\\x3d", "=")
-        .replace("\\/", "/");
-    let media_regex =
+    let normalized = normalize_serialized_scan_text(html);
+    let absolute_media_regex =
         Regex::new(r#"(?i)(?:https?:)?//[^\s\"'<>\\]+?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?"#)
             .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
+    let root_relative_media_regex = Regex::new(
+        r#"(?i)[\"'](/[^/\s\"'<>\\][^\s\"'<>\\]*?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?)"#,
+    )
+    .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
     let page_url = Url::parse(&discovery.page_url)
         .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
 
     let mut seen = discovery.media_urls.iter().cloned().collect::<HashSet<_>>();
-    for matched in media_regex.find_iter(&normalized) {
-        let candidate = matched.as_str().trim_end_matches([',', ';', '}', ']', ')']);
-        let parsed = if candidate.starts_with("//") {
-            page_url.join(candidate)
-        } else {
-            Url::parse(candidate)
-        };
-        let Ok(url) = parsed else {
-            continue;
-        };
-        if !matches!(url.scheme(), "http" | "https") {
-            continue;
-        }
-        let value = url.to_string();
-        if seen.insert(value.clone()) {
-            discovery.media_urls.push(value);
+    for matched in absolute_media_regex.find_iter(&normalized) {
+        push_media_candidate(
+            matched.as_str(),
+            &page_url,
+            &mut seen,
+            &mut discovery.media_urls,
+        );
+    }
+    for captures in root_relative_media_regex.captures_iter(&normalized) {
+        if let Some(candidate) = captures.get(1) {
+            push_media_candidate(
+                candidate.as_str(),
+                &page_url,
+                &mut seen,
+                &mut discovery.media_urls,
+            );
         }
     }
     Ok(())
+}
+
+fn normalize_serialized_scan_text(html: &str) -> String {
+    let mut normalized = html_escape::decode_html_entities(html).into_owned();
+    for _ in 0..3 {
+        let previous = normalized.clone();
+        normalized = normalized
+            .replace("\\u003A", ":")
+            .replace("\\u003a", ":")
+            .replace("\\u002F", "/")
+            .replace("\\u002f", "/")
+            .replace("\\u002E", ".")
+            .replace("\\u002e", ".")
+            .replace("\\u003F", "?")
+            .replace("\\u003f", "?")
+            .replace("\\u0026", "&")
+            .replace("\\u003D", "=")
+            .replace("\\u003d", "=")
+            .replace("\\x3A", ":")
+            .replace("\\x3a", ":")
+            .replace("\\x2F", "/")
+            .replace("\\x2f", "/")
+            .replace("\\x2E", ".")
+            .replace("\\x2e", ".")
+            .replace("\\x3F", "?")
+            .replace("\\x3f", "?")
+            .replace("\\x26", "&")
+            .replace("\\x3D", "=")
+            .replace("\\x3d", "=")
+            .replace("\\/", "/");
+        normalized = percent_decode_str(&normalized)
+            .decode_utf8_lossy()
+            .into_owned();
+        if normalized == previous {
+            break;
+        }
+    }
+    normalized
+}
+
+fn push_media_candidate(
+    raw_candidate: &str,
+    page_url: &Url,
+    seen: &mut HashSet<String>,
+    media_urls: &mut Vec<String>,
+) {
+    let candidate = raw_candidate
+        .trim()
+        .trim_end_matches([',', ';', '}', ']', ')']);
+    let Ok(url) = page_url.join(candidate) else {
+        return;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return;
+    }
+    let value = url.to_string();
+    if seen.insert(value.clone()) {
+        media_urls.push(value);
+    }
 }
 
 fn merge_browser_discovery(
@@ -182,6 +219,8 @@ fn merge_browser_discovery(
 
 fn log_static_diagnostics(page_url: &Url, html: &str, discovery: &WebPagePlaybackDiscovery) {
     let lower = html.to_ascii_lowercase();
+    let normalized = normalize_serialized_scan_text(html);
+    let normalized_lower = normalized.to_ascii_lowercase();
     tracing::info!(
         target: "synctv_media_providers::iqiyi",
         stage = "static_html",
@@ -190,6 +229,8 @@ fn log_static_diagnostics(page_url: &Url, html: &str, discovery: &WebPagePlaybac
         media_count = discovery.media_urls.len(),
         drm_detected = discovery.drm_detected,
         has_m3u8 = lower.contains(".m3u8"),
+        m3u8_occurrences = lower.match_indices(".m3u8").count(),
+        normalized_m3u8_occurrences = normalized_lower.match_indices(".m3u8").count(),
         has_mpd = lower.contains(".mpd"),
         has_mp4 = lower.contains(".mp4"),
         has_video_tag = lower.contains("<video"),
@@ -199,6 +240,12 @@ fn log_static_diagnostics(page_url: &Url, html: &str, discovery: &WebPagePlaybac
         has_tv_id = lower.contains("tvid") || lower.contains("tv_id"),
         has_unicode_url_escape = lower.contains(r"\u003a") || lower.contains(r"\u002f"),
         has_hex_url_escape = lower.contains(r"\x3a") || lower.contains(r"\x2f"),
+        has_percent_url_escape = lower.contains("%3a") || lower.contains("%2f"),
+        has_double_escaped_slash = lower.contains(r"\\/"),
+        normalized_has_http_media = normalized_lower.contains("http")
+            && (normalized_lower.contains(".m3u8")
+                || normalized_lower.contains(".mpd")
+                || normalized_lower.contains(".mp4")),
         "iQiyi playback discovery diagnostics"
     );
 }
@@ -378,6 +425,41 @@ mod tests {
             .media_urls
             .iter()
             .any(|url| url == "https://cdn.example/movie_720p.mp4?token=def&expires=999"));
+    }
+
+    #[test]
+    fn discovers_percent_encoded_and_root_relative_media_urls() {
+        let mut discovery = WebPagePlaybackDiscovery {
+            page_url: "https://www.iqiyi.com/v_demo.html".to_string(),
+            title: None,
+            media_urls: Vec::new(),
+            drm_detected: false,
+        };
+        let html = r#"
+            <script>
+              const encoded = "https%3A%2F%2Fcdn.example%2Fmovie_1080p.m3u8%3Ftoken%3Dabc%26expires%3D999";
+              const relative = "/media/movie_720p.m3u8?token=def";
+            </script>
+        "#;
+
+        discover_serialized_web_media(html, &mut discovery).expect("discover media");
+
+        assert!(discovery
+            .media_urls
+            .iter()
+            .any(|url| url == "https://cdn.example/movie_1080p.m3u8?token=abc&expires=999"));
+        assert!(discovery
+            .media_urls
+            .iter()
+            .any(|url| url == "https://www.iqiyi.com/media/movie_720p.m3u8?token=def"));
+    }
+
+    #[test]
+    fn repeatedly_decodes_double_escaped_slashes() {
+        let normalized = normalize_serialized_scan_text(
+            r#"const media = "https:\\/\\/cdn.example\\/movie_1080p.m3u8";"#,
+        );
+        assert!(normalized.contains("https://cdn.example/movie_1080p.m3u8"));
     }
 
     #[test]
