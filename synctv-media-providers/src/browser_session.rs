@@ -341,11 +341,9 @@ fn browser_stderr_preview(path: &Path) -> String {
 }
 
 async fn find_page_target(browser_ws_url: &str) -> Result<String, ProviderClientError> {
-    let (mut browser_socket, _) = connect_async(browser_ws_url)
-        .await
-        .map_err(|error| {
-            ProviderClientError::Network(format!("connect Chromium browser CDP: {error}"))
-        })?;
+    let (mut browser_socket, _) = connect_async(browser_ws_url).await.map_err(|error| {
+        ProviderClientError::Network(format!("connect Chromium browser CDP: {error}"))
+    })?;
     let mut command_id = 0_u64;
     let targets = cdp_call(
         &mut browser_socket,
@@ -359,13 +357,13 @@ async fn find_page_target(browser_ws_url: &str) -> Result<String, ProviderClient
         .get("targetInfos")
         .and_then(Value::as_array)
         .and_then(|targets| {
-            targets.iter().find_map(|target| {
-                (target.get("type").and_then(Value::as_str) == Some("page"))
-                    .then(|| target.get("targetId").and_then(Value::as_str))
-                    .flatten()
-                    .map(str::to_string)
+            targets.iter().find(|target| {
+                target.get("type").and_then(Value::as_str) == Some("page")
             })
-        });
+        })
+        .and_then(|target| target.get("targetId"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     let target_id = match target_id {
         Some(target_id) => target_id,
@@ -389,7 +387,10 @@ async fn find_page_target(browser_ws_url: &str) -> Result<String, ProviderClient
     page_target_ws_url(browser_ws_url, &target_id)
 }
 
-fn page_target_ws_url(browser_ws_url: &str, target_id: &str) -> Result<String, ProviderClientError> {
+fn page_target_ws_url(
+    browser_ws_url: &str,
+    target_id: &str,
+) -> Result<String, ProviderClientError> {
     let mut url = Url::parse(browser_ws_url).map_err(|error| {
         ProviderClientError::Parse(format!("invalid Chromium browser websocket URL: {error}"))
     })?;
@@ -643,11 +644,8 @@ mod tests {
     #[test]
     fn builds_page_target_websocket_from_browser_endpoint() {
         assert_eq!(
-            page_target_ws_url(
-                "ws://127.0.0.1:44385/devtools/browser/abc",
-                "page-id"
-            )
-            .expect("page target URL"),
+            page_target_ws_url("ws://127.0.0.1:44385/devtools/browser/abc", "page-id")
+                .expect("page target URL"),
             "ws://127.0.0.1:44385/devtools/page/page-id"
         );
     }
