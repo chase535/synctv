@@ -73,6 +73,14 @@ pub use credential::{
     InMemoryCredentialStorage, ProviderType, Result as CredentialResult, StoredCredential,
 };
 
+/// Browser identity used for authenticated provider web pages.
+///
+/// Chrome 152 is the current stable desktop major as of August 2026. Keep this
+/// separate from app WebViews: mobile WebViews use their native user agent only
+/// for login, while server-side page discovery identifies as a desktop browser.
+pub const PROVIDER_DESKTOP_WEB_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
+
 /// Build the shared HTTP client configuration used by local media-provider clients.
 #[must_use]
 pub fn provider_http_client_builder(
@@ -84,6 +92,7 @@ pub fn provider_http_client_builder(
         .connect_timeout(std::time::Duration::from_secs(10))
         .request_timeout(std::time::Duration::from_secs(30))
         .pool_max_idle_per_host(10)
+        .user_agent(PROVIDER_DESKTOP_WEB_USER_AGENT)
 }
 
 /// Build a media-provider HTTP client.
