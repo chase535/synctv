@@ -6,7 +6,7 @@ use url::Url;
 use crate::web_session::{
     discover_web_page_playback, ScopedWebSessionClient, SessionCookie, WebPagePlaybackDiscovery,
 };
-use crate::{ProviderClientError, PROVIDER_DESKTOP_WEB_USER_AGENT};
+use crate::ProviderClientError;
 
 pub const IQIYI_SESSION_DOMAINS: &[&str] = &["iqiyi.com", "qiyi.com"];
 
@@ -170,6 +170,7 @@ fn prioritize_full_hd_or_better(media_urls: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PROVIDER_DESKTOP_WEB_USER_AGENT;
 
     #[test]
     fn desktop_web_identity_tracks_current_stable_chrome() {
