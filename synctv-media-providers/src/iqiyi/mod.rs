@@ -3,7 +3,9 @@ use std::collections::HashSet;
 use regex::Regex;
 use url::Url;
 
-use crate::browser_session::{render_web_page_playback, BrowserPageDiagnostics, BrowserPageObservation};
+use crate::browser_session::{
+    render_web_page_playback, BrowserPageDiagnostics, BrowserPageObservation,
+};
 use crate::web_session::{
     discover_web_page_playback, ScopedWebSessionClient, SessionCookie, WebPagePlaybackDiscovery,
 };
@@ -129,10 +131,9 @@ fn discover_serialized_web_media(
         .replace("\\x3D", "=")
         .replace("\\x3d", "=")
         .replace("\\/", "/");
-    let media_regex = Regex::new(
-        r#"(?i)(?:https?:)?//[^\s\"'<>\\]+?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?"#,
-    )
-    .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
+    let media_regex =
+        Regex::new(r#"(?i)(?:https?:)?//[^\s\"'<>\\]+?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?"#)
+            .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
     let page_url = Url::parse(&discovery.page_url)
         .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
 
@@ -179,11 +180,7 @@ fn merge_browser_discovery(
     }
 }
 
-fn log_static_diagnostics(
-    page_url: &Url,
-    html: &str,
-    discovery: &WebPagePlaybackDiscovery,
-) {
+fn log_static_diagnostics(page_url: &Url, html: &str, discovery: &WebPagePlaybackDiscovery) {
     let lower = html.to_ascii_lowercase();
     tracing::info!(
         target: "synctv_media_providers::iqiyi",
