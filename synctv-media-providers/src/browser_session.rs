@@ -20,13 +20,13 @@ use crate::{ProviderClientError, PROVIDER_DESKTOP_WEB_USER_AGENT};
 const BROWSER_START_TIMEOUT: Duration = Duration::from_secs(20);
 const BROWSER_RENDER_TIMEOUT: Duration = Duration::from_secs(40);
 const BROWSER_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const BROWSER_LOCAL_HTTP_TIMEOUT: Duration = Duration::from_secs(1);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const PAGE_READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const PAGE_READY_POLL_ATTEMPTS: usize = 40;
 const PAGE_SETTLE_DELAY: Duration = Duration::from_secs(3);
 const MAX_CONCURRENT_BROWSER_RENDERS: usize = 2;
-const MAX_BROWSER_STDERR_PREVIEW_BYTES: u64 = 2048;
+const MAX_BROWSER_STDERR_PREVIEW_BYTES: u64 = 4096;
+const MAX_BROWSER_STDERR_SCAN_BYTES: u64 = 16384;
 
 static BROWSER_RENDER_SEMAPHORE: Semaphore = Semaphore::const_new(MAX_CONCURRENT_BROWSER_RENDERS);
 
@@ -65,14 +65,6 @@ struct BrowserObservationPayload {
     media_urls: Vec<String>,
     drm_detected: bool,
     diagnostics: BrowserPageDiagnostics,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DebugTarget {
-    #[serde(rename = "type")]
-    target_type: String,
-    web_socket_debugger_url: Option<String>,
 }
 
 struct ChromiumProcess {
@@ -125,13 +117,13 @@ async fn render_web_page_playback_inner(
             ProviderClientError::Network(format!("create browser profile: {error}"))
         })?;
 
-    let (mut browser, debugger_url) = start_chromium(&profile_dir).await?;
+    let (mut browser, browser_ws_url) = start_chromium(&profile_dir).await?;
     let result = async {
-        let target_ws_url = find_page_target(&debugger_url).await?;
+        let target_ws_url = find_page_target(&browser_ws_url).await?;
         let (mut socket, _) = connect_async(target_ws_url.as_str())
             .await
             .map_err(|error| {
-                ProviderClientError::Network(format!("connect browser CDP: {error}"))
+                ProviderClientError::Network(format!("connect browser page CDP: {error}"))
             })?;
         let mut command_id = 0_u64;
 
@@ -208,8 +200,6 @@ async fn start_chromium(
 ) -> Result<(ChromiumProcess, String), ProviderClientError> {
     let chromium_bin = chromium_binary();
     let debugging_port = reserve_local_port()?;
-    let debugger_url = format!("http://127.0.0.1:{debugging_port}");
-    let version_endpoint = format!("{debugger_url}/json/version");
     let stderr_path = profile_dir.join("chromium-stderr.log");
     let stderr_file = std::fs::File::create(&stderr_path).map_err(|error| {
         ProviderClientError::Network(format!("create Chromium stderr log: {error}"))
@@ -243,7 +233,6 @@ async fn start_chromium(
     let mut child = command.spawn().map_err(|error| {
         ProviderClientError::Network(format!("start Chromium ({chromium_bin}): {error}"))
     })?;
-    let local_client = local_cdp_client()?;
 
     let startup = tokio::time::timeout(BROWSER_START_TIMEOUT, async {
         loop {
@@ -262,17 +251,16 @@ async fn start_chromium(
                 }
             }
 
-            if let Ok(response) = local_client.get(&version_endpoint).send().await {
-                if response.status().is_success() {
-                    return Ok(());
-                }
+            if let Some(browser_ws_url) = browser_devtools_ws_url(&stderr_path) {
+                return Ok(browser_ws_url);
             }
+
             tokio::time::sleep(BROWSER_START_POLL_INTERVAL).await;
         }
     })
     .await;
 
-    match startup {
+    let browser_ws_url = match startup {
         Ok(result) => result?,
         Err(_) => {
             return Err(ProviderClientError::Network(format!(
@@ -281,13 +269,13 @@ async fn start_chromium(
                 browser_stderr_preview(&stderr_path)
             )));
         }
-    }
+    };
 
     tracing::debug!(
         target: "synctv_media_providers::browser_session",
         chromium_bin = %chromium_bin,
         debugging_port,
-        "Chromium DevTools endpoint ready"
+        "Chromium browser CDP websocket ready"
     );
 
     Ok((
@@ -295,7 +283,7 @@ async fn start_chromium(
             child,
             profile_dir: profile_dir.to_path_buf(),
         },
-        debugger_url,
+        browser_ws_url,
     ))
 }
 
@@ -320,25 +308,30 @@ fn reserve_local_port() -> Result<u16, ProviderClientError> {
     Ok(port)
 }
 
-fn local_cdp_client() -> Result<reqwest::Client, ProviderClientError> {
-    reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(BROWSER_LOCAL_HTTP_TIMEOUT)
-        .timeout(BROWSER_LOCAL_HTTP_TIMEOUT)
-        .build()
-        .map_err(|error| ProviderClientError::Network(format!("build local CDP client: {error}")))
+fn read_limited_file(path: &Path, max_bytes: u64) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut buffer = Vec::new();
+    let mut limited = file.take(max_bytes);
+    limited.read_to_end(&mut buffer).ok()?;
+    Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+fn browser_devtools_ws_url(path: &Path) -> Option<String> {
+    let text = read_limited_file(path, MAX_BROWSER_STDERR_SCAN_BYTES)?;
+    extract_devtools_ws_url(&text)
+}
+
+fn extract_devtools_ws_url(text: &str) -> Option<String> {
+    let (_, remainder) = text.rsplit_once("DevTools listening on ")?;
+    let candidate = remainder.split_whitespace().next()?.trim();
+    (candidate.starts_with("ws://") || candidate.starts_with("wss://"))
+        .then(|| candidate.to_string())
 }
 
 fn browser_stderr_preview(path: &Path) -> String {
-    let Ok(file) = std::fs::File::open(path) else {
+    let Some(preview) = read_limited_file(path, MAX_BROWSER_STDERR_PREVIEW_BYTES) else {
         return "unavailable".to_string();
     };
-    let mut buffer = Vec::new();
-    let mut limited = file.take(MAX_BROWSER_STDERR_PREVIEW_BYTES);
-    if limited.read_to_end(&mut buffer).is_err() {
-        return "unreadable".to_string();
-    }
-    let preview = String::from_utf8_lossy(&buffer);
     let compact = preview.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.is_empty() {
         "empty".to_string()
@@ -347,34 +340,63 @@ fn browser_stderr_preview(path: &Path) -> String {
     }
 }
 
-async fn find_page_target(debugger_url: &str) -> Result<String, ProviderClientError> {
-    let debugger = Url::parse(debugger_url).map_err(|error| {
-        ProviderClientError::Parse(format!("invalid Chromium debugger URL: {error}"))
-    })?;
-    let port = debugger.port().ok_or_else(|| {
-        ProviderClientError::Parse("Chromium debugger URL has no port".to_string())
-    })?;
-    let endpoint = format!("http://127.0.0.1:{port}/json/list");
-    let local_client = local_cdp_client()?;
+async fn find_page_target(browser_ws_url: &str) -> Result<String, ProviderClientError> {
+    let (mut browser_socket, _) = connect_async(browser_ws_url)
+        .await
+        .map_err(|error| {
+            ProviderClientError::Network(format!("connect Chromium browser CDP: {error}"))
+        })?;
+    let mut command_id = 0_u64;
+    let targets = cdp_call(
+        &mut browser_socket,
+        &mut command_id,
+        "Target.getTargets",
+        json!({}),
+    )
+    .await?;
 
-    for _ in 0..20 {
-        if let Ok(response) = local_client.get(&endpoint).send().await {
-            if let Ok(targets) = response.json::<Vec<DebugTarget>>().await {
-                if let Some(target) = targets.into_iter().find(|target| {
-                    target.target_type == "page" && target.web_socket_debugger_url.is_some()
-                }) {
-                    if let Some(url) = target.web_socket_debugger_url {
-                        return Ok(url);
-                    }
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let target_id = targets
+        .get("targetInfos")
+        .and_then(Value::as_array)
+        .and_then(|targets| {
+            targets.iter().find_map(|target| {
+                (target.get("type").and_then(Value::as_str) == Some("page"))
+                    .then(|| target.get("targetId").and_then(Value::as_str))
+                    .flatten()
+                    .map(str::to_string)
+            })
+        });
 
-    Err(ProviderClientError::Network(
-        "Chromium did not expose a page DevTools target".to_string(),
-    ))
+    let target_id = match target_id {
+        Some(target_id) => target_id,
+        None => cdp_call(
+            &mut browser_socket,
+            &mut command_id,
+            "Target.createTarget",
+            json!({ "url": "about:blank" }),
+        )
+        .await?
+        .get("targetId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ProviderClientError::Parse(
+                "Chromium Target.createTarget did not return targetId".to_string(),
+            )
+        })?,
+    };
+
+    page_target_ws_url(browser_ws_url, &target_id)
+}
+
+fn page_target_ws_url(browser_ws_url: &str, target_id: &str) -> Result<String, ProviderClientError> {
+    let mut url = Url::parse(browser_ws_url).map_err(|error| {
+        ProviderClientError::Parse(format!("invalid Chromium browser websocket URL: {error}"))
+    })?;
+    url.set_path(&format!("/devtools/page/{target_id}"));
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
 }
 
 async fn cdp_call(
@@ -607,5 +629,26 @@ mod tests {
             ],
         );
         assert_eq!(urls, vec!["https://cdn.example/movie.m3u8"]);
+    }
+
+    #[test]
+    fn extracts_browser_devtools_websocket_from_stderr() {
+        let text = "noise before\nDevTools listening on ws://127.0.0.1:44385/devtools/browser/abc\nnoise after";
+        assert_eq!(
+            extract_devtools_ws_url(text).as_deref(),
+            Some("ws://127.0.0.1:44385/devtools/browser/abc")
+        );
+    }
+
+    #[test]
+    fn builds_page_target_websocket_from_browser_endpoint() {
+        assert_eq!(
+            page_target_ws_url(
+                "ws://127.0.0.1:44385/devtools/browser/abc",
+                "page-id"
+            )
+            .expect("page target URL"),
+            "ws://127.0.0.1:44385/devtools/page/page-id"
+        );
     }
 }
