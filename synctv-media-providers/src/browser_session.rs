@@ -354,20 +354,18 @@ fn browser_stderr_preview(path: &Path) -> String {
 }
 
 async fn find_page_target(browser_ws_url: &str) -> Result<String, ProviderClientError> {
-    let (mut browser_socket, _) = tokio::time::timeout(
-        BROWSER_CONNECT_TIMEOUT,
-        connect_async(browser_ws_url),
-    )
-    .await
-    .map_err(|_| {
-        ProviderClientError::Network(format!(
-            "connect Chromium browser CDP timed out after {}s",
-            BROWSER_CONNECT_TIMEOUT.as_secs()
-        ))
-    })?
-    .map_err(|error| {
-        ProviderClientError::Network(format!("connect Chromium browser CDP: {error}"))
-    })?;
+    let (mut browser_socket, _) =
+        tokio::time::timeout(BROWSER_CONNECT_TIMEOUT, connect_async(browser_ws_url))
+            .await
+            .map_err(|_| {
+                ProviderClientError::Network(format!(
+                    "connect Chromium browser CDP timed out after {}s",
+                    BROWSER_CONNECT_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|error| {
+                ProviderClientError::Network(format!("connect Chromium browser CDP: {error}"))
+            })?;
     let mut command_id = 0_u64;
     let targets = cdp_call(
         &mut browser_socket,
