@@ -357,9 +357,9 @@ async fn find_page_target(browser_ws_url: &str) -> Result<String, ProviderClient
         .get("targetInfos")
         .and_then(Value::as_array)
         .and_then(|targets| {
-            targets.iter().find(|target| {
-                target.get("type").and_then(Value::as_str) == Some("page")
-            })
+            targets
+                .iter()
+                .find(|target| target.get("type").and_then(Value::as_str) == Some("page"))
         })
         .and_then(|target| target.get("targetId"))
         .and_then(Value::as_str)
