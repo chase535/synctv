@@ -88,20 +88,15 @@ fn discover_serialized_web_media(
         .replace("\\u0026", "&")
         .replace("\\u003D", "=")
         .replace("\\u003d", "=");
-    let media_regex = Regex::new(
-        r#"(?i)https?://[^\s\"'<>\\]+?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?"#,
-    )
-    .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
+    let media_regex =
+        Regex::new(r#"(?i)https?://[^\s\"'<>\\]+?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?"#)
+            .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
 
-    let mut seen = discovery
-        .media_urls
-        .iter()
-        .cloned()
-        .collect::<HashSet<_>>();
+    let mut seen = discovery.media_urls.iter().cloned().collect::<HashSet<_>>();
     for matched in media_regex.find_iter(&normalized) {
-        let candidate = matched.as_str().trim_end_matches(|ch: char| {
-            matches!(ch, ',' | ';' | '}' | ']' | ')')
-        });
+        let candidate = matched
+            .as_str()
+            .trim_end_matches(|ch: char| matches!(ch, ',' | ';' | '}' | ']' | ')'));
         let Ok(url) = Url::parse(candidate) else {
             continue;
         };
@@ -220,6 +215,8 @@ mod tests {
         ];
         prioritize_full_hd_or_better(&mut urls);
         assert_eq!(urls[0], "https://cdn.example/movie_720p.m3u8");
-        assert!(!urls.iter().any(|url| explicit_video_height(url) == Some(1080)));
+        assert!(!urls
+            .iter()
+            .any(|url| explicit_video_height(url) == Some(1080)));
     }
 }
