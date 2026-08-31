@@ -96,7 +96,7 @@ fn discover_serialized_web_media(
     for matched in media_regex.find_iter(&normalized) {
         let candidate = matched
             .as_str()
-            .trim_end_matches(|ch: char| matches!(ch, ',' | ';' | '}' | ']' | ')'));
+            .trim_end_matches([',', ';', '}', ']', ')']);
         let Ok(url) = Url::parse(candidate) else {
             continue;
         };
