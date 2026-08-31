@@ -372,6 +372,38 @@ async fn generate_playback(
     let credential_repo = ctx.credential_repo.ok_or_else(|| {
         ProviderError::Internal("provider credential repository is not configured".to_string())
     })?;
+    let access = load_web_session_access(credential_repo, http_client, owner, provider)
+        .await
+        .map_err(core_error)?;
+    let source_url = source.url.to_string();
+
+    // PlaybackService performs provider preflight before it commits the new
+    // room source. At that point the next playback_generation intentionally
+    // does not exist yet. Validate the authenticated page statelessly instead
+    // of fabricating a generation or creating a room-scoped provider session.
+    if ctx.playback_generation.is_none() {
+        let discovery = match provider {
+            WebSessionProvider::Iqiyi => IqiyiClient::new(http_client.clone(), access.cookies)
+                .map_err(provider_client_error)?
+                .discover_playback(&source_url)
+                .await
+                .map_err(provider_client_error)?,
+            WebSessionProvider::TencentVideo => {
+                TencentVideoClient::new(http_client.clone(), access.cookies)
+                    .map_err(provider_client_error)?
+                    .discover_playback(&source_url)
+                    .await
+                    .map_err(provider_client_error)?
+            }
+        };
+        let profile = ctx.playback_client_profile();
+        let result = filter_for_client(playback_from_discovery(provider, discovery)?, profile);
+        return super::require_compatible_playback_route(result, source.proxy_mode, profile);
+    }
+
+    // Once the room source transition has committed, playback_generation is
+    // server-owned and stable. Only this data-plane path creates/renews the
+    // room-scoped provider playback session and its cache entry.
     let db = ctx.db.ok_or_else(|| {
         ProviderError::Internal("provider database context is not configured".to_string())
     })?;
@@ -386,9 +418,6 @@ async fn generate_playback(
         .playback_generation
         .ok_or_else(|| ProviderError::MissingField("playback_generation".to_string()))?;
 
-    let access = load_web_session_access(credential_repo, http_client, owner, provider)
-        .await
-        .map_err(core_error)?;
     let coordinator = WebSessionPlaybackCoordinator::new(
         Arc::new(ProviderPlaybackSessionRepository::new(db.clone())),
         store,
@@ -398,11 +427,10 @@ async fn generate_playback(
         playback_generation,
         provider,
         credential_owner_id: owner,
-        resource_key: source.url.to_string(),
+        resource_key: source_url.clone(),
         resource_version: None,
         paused: !ctx.playback_is_playing.unwrap_or(true),
     };
-    let source_url = source.url.to_string();
     let http_client = http_client.clone();
 
     let result = coordinator
