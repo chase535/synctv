@@ -77,17 +77,34 @@ fn discover_serialized_web_media(
     html: &str,
     discovery: &mut WebPagePlaybackDiscovery,
 ) -> Result<(), ProviderClientError> {
-    // Work on a scan-only copy. JSON embedded in HTML commonly escapes '/'
-    // and query separators, so normalize those textual escapes before looking
-    // for URLs. This never executes page JavaScript.
+    // Work on a scan-only copy. JSON / JavaScript embedded in HTML commonly
+    // escapes URL punctuation, so normalize those textual escapes before
+    // looking for URLs. This never executes page JavaScript.
     let decoded = html_escape::decode_html_entities(html);
     let normalized = decoded
+        .replace("\\u003A", ":")
+        .replace("\\u003a", ":")
         .replace("\\u002F", "/")
         .replace("\\u002f", "/")
-        .replace("\\/", "/")
+        .replace("\\u002E", ".")
+        .replace("\\u002e", ".")
+        .replace("\\u003F", "?")
+        .replace("\\u003f", "?")
         .replace("\\u0026", "&")
         .replace("\\u003D", "=")
-        .replace("\\u003d", "=");
+        .replace("\\u003d", "=")
+        .replace("\\x3A", ":")
+        .replace("\\x3a", ":")
+        .replace("\\x2F", "/")
+        .replace("\\x2f", "/")
+        .replace("\\x2E", ".")
+        .replace("\\x2e", ".")
+        .replace("\\x3F", "?")
+        .replace("\\x3f", "?")
+        .replace("\\x26", "&")
+        .replace("\\x3D", "=")
+        .replace("\\x3d", "=")
+        .replace("\\/", "/");
     let media_regex = Regex::new(
         r#"(?i)(?:https?:)?//[^\s\"'<>\\]+?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?"#,
     )
@@ -236,6 +253,34 @@ mod tests {
             discovery.media_urls,
             vec!["https://cdn.example/movie_1080p.m3u8?token=abc"]
         );
+    }
+
+    #[test]
+    fn discovers_unicode_and_hex_escaped_serialized_media() {
+        let mut discovery = WebPagePlaybackDiscovery {
+            page_url: "https://www.iqiyi.com/v_demo.html".to_string(),
+            title: None,
+            media_urls: Vec::new(),
+            drm_detected: false,
+        };
+        let html = r#"
+            <script>
+              window.__BOOTSTRAP__ = {
+                "primary":"https\u003A\u002F\u002Fcdn.example\u002Fmovie_1080p.m3u8\u003Ftoken\u003Dabc\u0026expires\u003D9999999999",
+                "backup":"https\x3A\x2F\x2Fcdn.example\x2Fmovie_720p.mp4\x3Ftoken\x3Ddef"
+              };
+            </script>
+        "#;
+
+        discover_serialized_web_media(html, &mut discovery).expect("discover media");
+
+        assert!(discovery.media_urls.iter().any(|url| {
+            url == "https://cdn.example/movie_1080p.m3u8?token=abc&expires=9999999999"
+        }));
+        assert!(discovery
+            .media_urls
+            .iter()
+            .any(|url| url == "https://cdn.example/movie_720p.mp4?token=def"));
     }
 
     #[test]
