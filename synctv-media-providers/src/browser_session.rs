@@ -2,11 +2,14 @@ use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use moka::future::Cache;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Semaphore;
@@ -25,11 +28,14 @@ const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
 const PAGE_READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const PAGE_READY_POLL_ATTEMPTS: usize = 20;
 const PAGE_SETTLE_DELAY: Duration = Duration::from_secs(2);
+const BROWSER_RENDER_CACHE_TTL: Duration = Duration::from_secs(10);
+const BROWSER_RENDER_CACHE_CAPACITY: u64 = 64;
 const MAX_CONCURRENT_BROWSER_RENDERS: usize = 2;
 const MAX_BROWSER_STDERR_PREVIEW_BYTES: u64 = 4096;
 const MAX_BROWSER_STDERR_SCAN_BYTES: u64 = 16384;
 
 static BROWSER_RENDER_SEMAPHORE: Semaphore = Semaphore::const_new(MAX_CONCURRENT_BROWSER_RENDERS);
+static BROWSER_RENDER_CACHE: OnceLock<Cache<String, BrowserPageObservation>> = OnceLock::new();
 
 type CdpSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -92,11 +98,22 @@ pub async fn render_web_page_playback(
     allowed_domains: &'static [&'static str],
     cookies: &[SessionCookie],
 ) -> Result<BrowserPageObservation, ProviderClientError> {
-    tokio::time::timeout(BROWSER_RENDER_TIMEOUT, async {
-        let _permit = BROWSER_RENDER_SEMAPHORE.acquire().await.map_err(|error| {
-            ProviderClientError::Network(format!("browser discovery semaphore closed: {error}"))
-        })?;
-        render_web_page_playback_inner(raw_url, allowed_domains, cookies).await
+    let cache_key = browser_render_cache_key(raw_url, allowed_domains, cookies);
+    let raw_url = raw_url.to_string();
+    let cookies = cookies.to_vec();
+
+    tokio::time::timeout(BROWSER_RENDER_TIMEOUT, async move {
+        browser_render_cache()
+            .try_get_with(cache_key, async move {
+                let _permit = BROWSER_RENDER_SEMAPHORE.acquire().await.map_err(|error| {
+                    ProviderClientError::Network(format!(
+                        "browser discovery semaphore closed: {error}"
+                    ))
+                })?;
+                render_web_page_playback_inner(&raw_url, allowed_domains, &cookies).await
+            })
+            .await
+            .map_err(|error| clone_provider_client_error(error.as_ref()))
     })
     .await
     .map_err(|_| {
@@ -105,6 +122,90 @@ pub async fn render_web_page_playback(
             BROWSER_RENDER_TIMEOUT.as_secs()
         ))
     })?
+}
+
+fn browser_render_cache() -> &'static Cache<String, BrowserPageObservation> {
+    BROWSER_RENDER_CACHE.get_or_init(|| {
+        Cache::builder()
+            .max_capacity(BROWSER_RENDER_CACHE_CAPACITY)
+            .time_to_live(BROWSER_RENDER_CACHE_TTL)
+            .build()
+    })
+}
+
+fn browser_render_cache_key(
+    raw_url: &str,
+    allowed_domains: &[&str],
+    cookies: &[SessionCookie],
+) -> String {
+    let mut hasher = Sha256::new();
+    update_render_key_digest(&mut hasher, raw_url.as_bytes());
+
+    let mut domains = allowed_domains.to_vec();
+    domains.sort_unstable();
+    for domain in domains {
+        update_render_key_digest(&mut hasher, domain.as_bytes());
+    }
+
+    let mut cookies = cookies.to_vec();
+    cookies.sort_by(|left, right| {
+        left.domain
+            .cmp(&right.domain)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    for cookie in cookies {
+        update_render_key_digest(&mut hasher, cookie.name.as_bytes());
+        update_render_key_digest(&mut hasher, cookie.value.as_bytes());
+        update_render_key_digest(&mut hasher, cookie.domain.as_bytes());
+        update_render_key_digest(&mut hasher, cookie.path.as_bytes());
+        hasher.update([
+            u8::from(cookie.secure),
+            u8::from(cookie.http_only),
+            u8::from(cookie.session_only),
+        ]);
+        hasher.update(cookie.expires_at.unwrap_or(i64::MIN).to_le_bytes());
+    }
+
+    hex::encode(hasher.finalize())
+}
+
+fn update_render_key_digest(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(value);
+}
+
+fn clone_provider_client_error(error: &ProviderClientError) -> ProviderClientError {
+    match error {
+        ProviderClientError::Network(message) => ProviderClientError::Network(message.clone()),
+        ProviderClientError::Http {
+            status,
+            url,
+            retry_after_secs,
+            body,
+        } => ProviderClientError::Http {
+            status: *status,
+            url: url.clone(),
+            retry_after_secs: *retry_after_secs,
+            body: body.clone(),
+        },
+        ProviderClientError::Api { code, message } => ProviderClientError::Api {
+            code: *code,
+            message: message.clone(),
+        },
+        ProviderClientError::Parse(message) => ProviderClientError::Parse(message.clone()),
+        ProviderClientError::Auth(message) => ProviderClientError::Auth(message.clone()),
+        ProviderClientError::InvalidConfig(message) => {
+            ProviderClientError::InvalidConfig(message.clone())
+        }
+        ProviderClientError::InvalidHeader(message) => {
+            ProviderClientError::InvalidHeader(message.clone())
+        }
+        ProviderClientError::ResponseTooLarge { size } => {
+            ProviderClientError::ResponseTooLarge { size: *size }
+        }
+    }
 }
 
 async fn render_web_page_playback_inner(
@@ -652,6 +753,39 @@ mod tests {
             ],
         );
         assert_eq!(urls, vec!["https://cdn.example/movie.m3u8"]);
+    }
+
+    #[test]
+    fn browser_render_cache_key_is_order_independent_and_session_scoped() {
+        let first = SessionCookie {
+            name: "P00001".to_string(),
+            value: "session-a".to_string(),
+            domain: ".iqiyi.com".to_string(),
+            path: "/".to_string(),
+            secure: true,
+            http_only: true,
+            session_only: false,
+            expires_at: Some(1_900_000_000),
+        };
+        let second = SessionCookie {
+            name: "QC005".to_string(),
+            value: "secondary".to_string(),
+            domain: ".iqiyi.com".to_string(),
+            path: "/".to_string(),
+            secure: true,
+            http_only: false,
+            session_only: true,
+            expires_at: None,
+        };
+        let url = "https://www.iqiyi.com/v_demo.html";
+        let forward = browser_render_cache_key(url, &["iqiyi.com", "qiyi.com"], &[first.clone(), second.clone()]);
+        let reversed = browser_render_cache_key(url, &["qiyi.com", "iqiyi.com"], &[second, first.clone()]);
+        assert_eq!(forward, reversed);
+
+        let mut changed = first;
+        changed.value = "session-b".to_string();
+        let changed_key = browser_render_cache_key(url, &["iqiyi.com", "qiyi.com"], &[changed]);
+        assert_ne!(forward, changed_key);
     }
 
     #[test]
