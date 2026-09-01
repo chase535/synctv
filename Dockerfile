@@ -122,13 +122,25 @@ RUN apt-get update && apt-get install -y \
     chromium \
     curl && rm -rf /var/lib/apt/lists/*
 
+# Provider pages frequently defer media initialization until autoplay is
+# permitted and a desktop-sized viewport is present. Keep those policy/layout
+# flags in a wrapper so browser_session can continue treating CHROMIUM_BIN as a
+# normal executable while every fallback launch gets the same deterministic
+# low-overhead playback environment. The wrapper does not bypass authentication;
+# the authenticated cookie jar is still installed by the provider session.
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'exec /usr/bin/chromium --autoplay-policy=no-user-gesture-required --window-size=1280,720 "$@"' \
+    > /usr/local/bin/synctv-chromium && \
+    chmod 0755 /usr/local/bin/synctv-chromium
+
 # Keep Chromium discovery deterministic inside Docker and reduce allocator
 # growth on memory-constrained hosts. Two Tokio workers preserve timer/SQL/
 # WebSocket liveness if one worker is briefly delayed by kernel or filesystem
 # pressure on a single-core VPS; this does not create additional CPU capacity.
 # Chromium itself is launched with --disable-dev-shm-usage because Docker's
 # default /dev/shm is typically small.
-ENV CHROMIUM_BIN=/usr/bin/chromium \
+ENV CHROMIUM_BIN=/usr/local/bin/synctv-chromium \
     MALLOC_ARENA_MAX=2 \
     TOKIO_WORKER_THREADS=2
 
@@ -150,7 +162,7 @@ COPY --from=builder /synctv /usr/local/bin/synctv
 USER synctv
 
 # Verify PATH resolution and runtime dependencies using the production user.
-RUN command -v synctv && synctv --version && command -v chromium
+RUN command -v synctv && synctv --version && command -v chromium && command -v synctv-chromium
 
 # Expose ports
 # 8080: HTTP API + public gRPC (also serves HLS via /api/room/movie/live/hls/*)
