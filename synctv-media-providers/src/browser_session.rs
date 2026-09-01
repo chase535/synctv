@@ -1,15 +1,12 @@
 use std::collections::HashSet;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use moka::future::Cache;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Semaphore;
@@ -20,22 +17,27 @@ use url::Url;
 use crate::web_session::{SessionCookie, WebPagePlaybackDiscovery};
 use crate::{ProviderClientError, PROVIDER_DESKTOP_WEB_USER_AGENT};
 
-const BROWSER_START_TIMEOUT: Duration = Duration::from_secs(10);
+const BROWSER_QUEUE_TIMEOUT: Duration = Duration::from_secs(12);
 const BROWSER_RENDER_TIMEOUT: Duration = Duration::from_secs(22);
+const BROWSER_START_TIMEOUT: Duration = Duration::from_secs(12);
 const BROWSER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const BROWSER_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
-const PAGE_READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const PAGE_READY_POLL_ATTEMPTS: usize = 20;
-const PAGE_SETTLE_DELAY: Duration = Duration::from_secs(2);
-const BROWSER_RENDER_CACHE_TTL: Duration = Duration::from_secs(10);
-const BROWSER_RENDER_CACHE_CAPACITY: u64 = 64;
-const MAX_CONCURRENT_BROWSER_RENDERS: usize = 2;
-const MAX_BROWSER_STDERR_PREVIEW_BYTES: u64 = 4096;
-const MAX_BROWSER_STDERR_SCAN_BYTES: u64 = 16384;
+const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
+const BROWSER_PROBE_INTERVAL: Duration = Duration::from_millis(400);
+const BROWSER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(7);
+const BLOB_VIDEO_GRACE_DELAY: Duration = Duration::from_secs(3);
+const MAX_CONCURRENT_BROWSER_RENDERS: usize = 1;
+const MAX_BROWSER_STDERR_TAIL_BYTES: u64 = 16 * 1024;
+const MAX_LOGGED_MEDIA_HOSTS: usize = 5;
+const CDP_MAX_TOTAL_BUFFER_SIZE: u64 = 1_000_000;
+const CDP_MAX_RESOURCE_BUFFER_SIZE: u64 = 256_000;
+
+const BLOCKED_RESOURCE_URL_PATTERNS: &[&str] = &[
+    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg", "*.ico", "*.woff", "*.woff2",
+    "*.ttf", "*.otf",
+];
 
 static BROWSER_RENDER_SEMAPHORE: Semaphore = Semaphore::const_new(MAX_CONCURRENT_BROWSER_RENDERS);
-static BROWSER_RENDER_CACHE: OnceLock<Cache<String, BrowserPageObservation>> = OnceLock::new();
 
 type CdpSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -74,6 +76,26 @@ struct BrowserObservationPayload {
     diagnostics: BrowserPageDiagnostics,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserProbePayload {
+    ready_state: String,
+    resource_count: usize,
+    xhr_fetch_count: usize,
+    segment_like_count: usize,
+    video_element_count: usize,
+    media_urls: Vec<String>,
+    has_blob_video: bool,
+    has_license_resource: bool,
+}
+
+struct BrowserProbeOutcome {
+    payload: BrowserProbePayload,
+    reason: &'static str,
+    attempts: usize,
+    elapsed: Duration,
+}
+
 struct ChromiumProcess {
     child: Child,
     profile_dir: PathBuf,
@@ -98,110 +120,83 @@ pub async fn render_web_page_playback(
     allowed_domains: &'static [&'static str],
     cookies: &[SessionCookie],
 ) -> Result<BrowserPageObservation, ProviderClientError> {
-    let cache_key = browser_render_cache_key(raw_url, allowed_domains, cookies);
-    let raw_url = raw_url.to_string();
-    let cookies = cookies.to_vec();
+    let page_host = page_host(raw_url);
+    let request_started = Instant::now();
 
-    let initializer = Box::pin(async move {
-        let _permit = BROWSER_RENDER_SEMAPHORE.acquire().await.map_err(|error| {
-            ProviderClientError::Network(format!("browser discovery semaphore closed: {error}"))
-        })?;
-        render_web_page_playback_inner(&raw_url, allowed_domains, &cookies).await
-    });
-    let render = Box::pin(browser_render_cache().try_get_with(cache_key, initializer));
-    let result = tokio::time::timeout(BROWSER_RENDER_TIMEOUT, render)
+    tracing::info!(
+        target: "synctv_media_providers::browser_session",
+        stage = "render_requested",
+        page_host = %page_host,
+        cookie_count = cookies.len(),
+        max_concurrent_renders = MAX_CONCURRENT_BROWSER_RENDERS,
+        queue_timeout_ms = BROWSER_QUEUE_TIMEOUT.as_millis(),
+        render_timeout_ms = BROWSER_RENDER_TIMEOUT.as_millis(),
+        "Authenticated browser page render diagnostics"
+    );
+    log_container_resources("render_requested", &page_host);
+
+    let queue_started = Instant::now();
+    let permit = tokio::time::timeout(BROWSER_QUEUE_TIMEOUT, BROWSER_RENDER_SEMAPHORE.acquire())
         .await
         .map_err(|_| {
+            tracing::warn!(
+                target: "synctv_media_providers::browser_session",
+                stage = "browser_slot_timeout",
+                page_host = %page_host,
+                wait_ms = queue_started.elapsed().as_millis(),
+                "Authenticated browser page render diagnostics"
+            );
             ProviderClientError::Network(format!(
-                "browser page rendering timed out after {}s",
-                BROWSER_RENDER_TIMEOUT.as_secs()
+                "browser discovery slot timed out after {}s",
+                BROWSER_QUEUE_TIMEOUT.as_secs()
             ))
+        })?
+        .map_err(|error| {
+            ProviderClientError::Network(format!("browser discovery semaphore closed: {error}"))
         })?;
-    result.map_err(|error| clone_provider_client_error(error.as_ref()))
-}
 
-fn browser_render_cache() -> &'static Cache<String, BrowserPageObservation> {
-    BROWSER_RENDER_CACHE.get_or_init(|| {
-        Cache::builder()
-            .max_capacity(BROWSER_RENDER_CACHE_CAPACITY)
-            .time_to_live(BROWSER_RENDER_CACHE_TTL)
-            .build()
-    })
-}
+    tracing::info!(
+        target: "synctv_media_providers::browser_session",
+        stage = "browser_slot_acquired",
+        page_host = %page_host,
+        wait_ms = queue_started.elapsed().as_millis(),
+        "Authenticated browser page render diagnostics"
+    );
 
-fn browser_render_cache_key(
-    raw_url: &str,
-    allowed_domains: &[&str],
-    cookies: &[SessionCookie],
-) -> String {
-    let mut hasher = Sha256::new();
-    update_render_key_digest(&mut hasher, raw_url.as_bytes());
+    let render_started = Instant::now();
+    let result = tokio::time::timeout(
+        BROWSER_RENDER_TIMEOUT,
+        render_web_page_playback_inner(raw_url, allowed_domains, cookies),
+    )
+    .await
+    .map_err(|_| {
+        tracing::warn!(
+            target: "synctv_media_providers::browser_session",
+            stage = "render_timeout",
+            page_host = %page_host,
+            render_elapsed_ms = render_started.elapsed().as_millis(),
+            total_elapsed_ms = request_started.elapsed().as_millis(),
+            "Authenticated browser page render diagnostics"
+        );
+        ProviderClientError::Network(format!(
+            "browser page rendering timed out after {}s",
+            BROWSER_RENDER_TIMEOUT.as_secs()
+        ))
+    })?;
 
-    let mut domains = allowed_domains.to_vec();
-    domains.sort_unstable();
-    for domain in domains {
-        update_render_key_digest(&mut hasher, domain.as_bytes());
-    }
+    drop(permit);
+    log_container_resources("render_finished", &page_host);
+    tracing::info!(
+        target: "synctv_media_providers::browser_session",
+        stage = "render_finished",
+        page_host = %page_host,
+        success = result.is_ok(),
+        render_elapsed_ms = render_started.elapsed().as_millis(),
+        total_elapsed_ms = request_started.elapsed().as_millis(),
+        "Authenticated browser page render diagnostics"
+    );
 
-    let mut cookies = cookies.to_vec();
-    cookies.sort_by(|left, right| {
-        left.domain
-            .cmp(&right.domain)
-            .then_with(|| left.path.cmp(&right.path))
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.value.cmp(&right.value))
-    });
-    for cookie in cookies {
-        update_render_key_digest(&mut hasher, cookie.name.as_bytes());
-        update_render_key_digest(&mut hasher, cookie.value.as_bytes());
-        update_render_key_digest(&mut hasher, cookie.domain.as_bytes());
-        update_render_key_digest(&mut hasher, cookie.path.as_bytes());
-        hasher.update([
-            u8::from(cookie.secure),
-            u8::from(cookie.http_only),
-            u8::from(cookie.session_only),
-        ]);
-        hasher.update(cookie.expires_at.unwrap_or(i64::MIN).to_le_bytes());
-    }
-
-    hex::encode(hasher.finalize())
-}
-
-fn update_render_key_digest(hasher: &mut Sha256, value: &[u8]) {
-    hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
-    hasher.update(value);
-}
-
-fn clone_provider_client_error(error: &ProviderClientError) -> ProviderClientError {
-    match error {
-        ProviderClientError::Network(message) => ProviderClientError::Network(message.clone()),
-        ProviderClientError::Http {
-            status,
-            url,
-            retry_after_secs,
-            body,
-        } => ProviderClientError::Http {
-            status: *status,
-            url: url.clone(),
-            retry_after_secs: *retry_after_secs,
-            body: body.clone(),
-        },
-        ProviderClientError::Api { code, message } => ProviderClientError::Api {
-            code: *code,
-            message: message.clone(),
-        },
-        ProviderClientError::Parse(message) => ProviderClientError::Parse(message.clone()),
-        ProviderClientError::Auth(message) => ProviderClientError::Auth(message.clone()),
-        ProviderClientError::InvalidConfig(message) => {
-            ProviderClientError::InvalidConfig(message.clone())
-        }
-        ProviderClientError::InvalidHeader(message) => {
-            ProviderClientError::InvalidHeader(message.clone())
-        }
-        ProviderClientError::ResponseTooLarge { size } => {
-            ProviderClientError::ResponseTooLarge { size: *size }
-        }
-    }
+    result
 }
 
 async fn render_web_page_playback_inner(
@@ -210,6 +205,7 @@ async fn render_web_page_playback_inner(
     cookies: &[SessionCookie],
 ) -> Result<BrowserPageObservation, ProviderClientError> {
     let page_url = validate_provider_url(raw_url, allowed_domains)?;
+    let page_host = page_url.host_str().unwrap_or("").to_string();
     let profile_dir =
         std::env::temp_dir().join(format!("synctv-chromium-{}", uuid::Uuid::new_v4().simple()));
     tokio::fs::create_dir_all(&profile_dir)
@@ -218,9 +214,34 @@ async fn render_web_page_playback_inner(
             ProviderClientError::Network(format!("create browser profile: {error}"))
         })?;
 
-    let (mut browser, browser_ws_url) = start_chromium(&profile_dir).await?;
+    tracing::info!(
+        target: "synctv_media_providers::browser_session",
+        stage = "profile_ready",
+        page_host = %page_host,
+        profile_parent = %profile_dir.parent().unwrap_or(Path::new("/tmp")).display(),
+        "Authenticated browser page render diagnostics"
+    );
+
+    let (mut browser, browser_ws_url) = match start_chromium(&profile_dir, &page_host).await {
+        Ok(browser) => browser,
+        Err(error) => {
+            let _ = tokio::fs::remove_dir_all(&profile_dir).await;
+            return Err(error);
+        }
+    };
+
     let result = async {
+        let target_started = Instant::now();
         let target_ws_url = find_page_target(&browser_ws_url).await?;
+        tracing::info!(
+            target: "synctv_media_providers::browser_session",
+            stage = "page_target_ready",
+            page_host = %page_host,
+            elapsed_ms = target_started.elapsed().as_millis(),
+            "Authenticated browser page render diagnostics"
+        );
+
+        let connect_started = Instant::now();
         let (mut socket, _) = tokio::time::timeout(
             BROWSER_CONNECT_TIMEOUT,
             connect_async(target_ws_url.as_str()),
@@ -235,11 +256,53 @@ async fn render_web_page_playback_inner(
         .map_err(|error| {
             ProviderClientError::Network(format!("connect browser page CDP: {error}"))
         })?;
-        let mut command_id = 0_u64;
+        tracing::info!(
+            target: "synctv_media_providers::browser_session",
+            stage = "page_cdp_connected",
+            page_host = %page_host,
+            elapsed_ms = connect_started.elapsed().as_millis(),
+            "Authenticated browser page render diagnostics"
+        );
 
-        cdp_call(&mut socket, &mut command_id, "Network.enable", json!({})).await?;
+        let mut command_id = 0_u64;
+        cdp_call(
+            &mut socket,
+            &mut command_id,
+            "Network.enable",
+            json!({
+                "maxTotalBufferSize": CDP_MAX_TOTAL_BUFFER_SIZE,
+                "maxResourceBufferSize": CDP_MAX_RESOURCE_BUFFER_SIZE,
+            }),
+        )
+        .await?;
         cdp_call(&mut socket, &mut command_id, "Page.enable", json!({})).await?;
         cdp_call(&mut socket, &mut command_id, "Runtime.enable", json!({})).await?;
+        cdp_call_best_effort(
+            &mut socket,
+            &mut command_id,
+            "Network.setCacheDisabled",
+            json!({ "cacheDisabled": true }),
+            &page_host,
+        )
+        .await;
+        cdp_call_best_effort(
+            &mut socket,
+            &mut command_id,
+            "Network.setBlockedURLs",
+            json!({ "urls": BLOCKED_RESOURCE_URL_PATTERNS }),
+            &page_host,
+        )
+        .await;
+
+        tracing::info!(
+            target: "synctv_media_providers::browser_session",
+            stage = "cdp_configured",
+            page_host = %page_host,
+            blocked_pattern_count = BLOCKED_RESOURCE_URL_PATTERNS.len(),
+            devtools_total_buffer_bytes = CDP_MAX_TOTAL_BUFFER_SIZE,
+            devtools_resource_buffer_bytes = CDP_MAX_RESOURCE_BUFFER_SIZE,
+            "Authenticated browser page render diagnostics"
+        );
 
         if !cookies.is_empty() {
             let cookie_params = cookies
@@ -253,8 +316,16 @@ async fn render_web_page_playback_inner(
                 json!({ "cookies": cookie_params }),
             )
             .await?;
+            tracing::info!(
+                target: "synctv_media_providers::browser_session",
+                stage = "cookies_installed",
+                page_host = %page_host,
+                cookie_count = cookies.len(),
+                "Authenticated browser page render diagnostics"
+            );
         }
 
+        let navigate_started = Instant::now();
         cdp_call(
             &mut socket,
             &mut command_id,
@@ -262,9 +333,17 @@ async fn render_web_page_playback_inner(
             json!({ "url": page_url.as_str() }),
         )
         .await?;
-        wait_for_page_ready(&mut socket, &mut command_id).await?;
-        tokio::time::sleep(PAGE_SETTLE_DELAY).await;
+        tracing::info!(
+            target: "synctv_media_providers::browser_session",
+            stage = "navigation_started",
+            page_host = %page_host,
+            elapsed_ms = navigate_started.elapsed().as_millis(),
+            "Authenticated browser page render diagnostics"
+        );
 
+        let probe = wait_for_browser_signal(&mut socket, &mut command_id, &page_host).await?;
+
+        let observation_started = Instant::now();
         let evaluation = cdp_call(
             &mut socket,
             &mut command_id,
@@ -284,10 +363,33 @@ async fn render_web_page_playback_inner(
                     "browser observation did not return a serialized value".to_string(),
                 )
             })?;
-        let payload: BrowserObservationPayload = serde_json::from_str(serialized)
+        let mut payload: BrowserObservationPayload = serde_json::from_str(serialized)
             .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
+
+        payload.media_urls.extend(probe.payload.media_urls);
         let final_url = validate_provider_url(&payload.current_url, allowed_domains)?;
         let media_urls = normalize_media_urls(&final_url, payload.media_urls);
+        let media_hosts = summarize_media_hosts(&media_urls);
+        let media_kinds = summarize_media_kinds(&media_urls);
+
+        tracing::info!(
+            target: "synctv_media_providers::browser_session",
+            stage = "observation_complete",
+            page_host = %page_host,
+            probe_reason = probe.reason,
+            probe_attempts = probe.attempts,
+            probe_elapsed_ms = probe.elapsed.as_millis(),
+            observation_elapsed_ms = observation_started.elapsed().as_millis(),
+            ready_state = %payload.diagnostics.ready_state,
+            resource_count = payload.diagnostics.resource_count,
+            media_resource_count = payload.diagnostics.media_resource_count,
+            media_count = media_urls.len(),
+            media_hosts = %media_hosts,
+            media_kinds = %media_kinds,
+            has_blob_video = payload.diagnostics.has_blob_video,
+            drm_detected = payload.drm_detected,
+            "Authenticated browser page render diagnostics"
+        );
 
         Ok(BrowserPageObservation {
             discovery: WebPagePlaybackDiscovery {
@@ -307,9 +409,9 @@ async fn render_web_page_playback_inner(
 
 async fn start_chromium(
     profile_dir: &Path,
+    page_host: &str,
 ) -> Result<(ChromiumProcess, String), ProviderClientError> {
     let chromium_bin = chromium_binary();
-    let debugging_port = reserve_local_port()?;
     let stderr_path = profile_dir.join("chromium-stderr.log");
     let stderr_file = std::fs::File::create(&stderr_path).map_err(|error| {
         ProviderClientError::Network(format!("create Chromium stderr log: {error}"))
@@ -326,12 +428,21 @@ async fn start_chromium(
         .arg("--disable-default-apps")
         .arg("--disable-extensions")
         .arg("--disable-sync")
+        .arg("--disable-notifications")
+        .arg("--disable-domain-reliability")
+        .arg("--disable-client-side-phishing-detection")
+        .arg("--disable-breakpad")
+        .arg("--disable-crash-reporter")
         .arg("--metrics-recording-only")
+        .arg("--mute-audio")
+        .arg("--hide-scrollbars")
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
+        .arg("--no-service-autorun")
+        .arg("--renderer-process-limit=1")
         .arg("--remote-allow-origins=*")
         .arg("--remote-debugging-address=127.0.0.1")
-        .arg(format!("--remote-debugging-port={debugging_port}"))
+        .arg("--remote-debugging-port=0")
         .arg(format!("--user-agent={PROVIDER_DESKTOP_WEB_USER_AGENT}"))
         .arg(format!("--user-data-dir={}", profile_dir.display()))
         .arg("about:blank")
@@ -340,17 +451,31 @@ async fn start_chromium(
         .stderr(Stdio::from(stderr_file))
         .kill_on_drop(true);
 
+    let spawn_started = Instant::now();
     let mut child = command.spawn().map_err(|error| {
         ProviderClientError::Network(format!("start Chromium ({chromium_bin}): {error}"))
     })?;
+    let browser_pid = child.id().unwrap_or_default();
 
+    tracing::info!(
+        target: "synctv_media_providers::browser_session",
+        stage = "chromium_spawned",
+        page_host = %page_host,
+        chromium_bin = %chromium_bin,
+        browser_pid,
+        spawn_elapsed_ms = spawn_started.elapsed().as_millis(),
+        "Authenticated browser page render diagnostics"
+    );
+    log_container_resources("chromium_spawned", page_host);
+
+    let startup_started = Instant::now();
     let startup = tokio::time::timeout(BROWSER_START_TIMEOUT, async {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     return Err(ProviderClientError::Network(format!(
-                        "Chromium exited before DevTools became ready: status={status}; stderr={}",
-                        browser_stderr_preview(&stderr_path)
+                        "Chromium exited before DevTools became ready: status={status}; stderr_tail={}",
+                        browser_stderr_tail(&stderr_path)
                     )));
                 }
                 Ok(None) => {}
@@ -361,8 +486,15 @@ async fn start_chromium(
                 }
             }
 
-            if let Some(browser_ws_url) = browser_devtools_ws_url(&stderr_path) {
-                return Ok(browser_ws_url);
+            if let Some((browser_ws_url, debugging_port)) =
+                browser_devtools_active_port(profile_dir)
+            {
+                return Ok((browser_ws_url, debugging_port));
+            }
+            if let Some((browser_ws_url, debugging_port)) =
+                browser_devtools_ws_from_stderr(&stderr_path)
+            {
+                return Ok((browser_ws_url, debugging_port));
             }
 
             tokio::time::sleep(BROWSER_START_POLL_INTERVAL).await;
@@ -370,23 +502,52 @@ async fn start_chromium(
     })
     .await;
 
-    let browser_ws_url = match startup {
-        Ok(result) => result?,
+    let (browser_ws_url, debugging_port) = match startup {
+        Ok(Ok(ready)) => ready,
+        Ok(Err(error)) => {
+            log_container_resources("chromium_start_failed", page_host);
+            let _ = child.kill().await;
+            return Err(error);
+        }
         Err(_) => {
+            let stderr_tail = browser_stderr_tail(&stderr_path);
+            let stderr_bytes = std::fs::metadata(&stderr_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or_default();
+            log_container_resources("chromium_start_timeout", page_host);
+            tracing::warn!(
+                target: "synctv_media_providers::browser_session",
+                stage = "chromium_start_timeout",
+                page_host = %page_host,
+                chromium_bin = %chromium_bin,
+                browser_pid,
+                elapsed_ms = startup_started.elapsed().as_millis(),
+                stderr_bytes,
+                stderr_tail = %stderr_tail,
+                "Authenticated browser page render diagnostics"
+            );
+            let _ = child.kill().await;
             return Err(ProviderClientError::Network(format!(
-                "Chromium DevTools startup timed out after {}s; binary={chromium_bin}; stderr={}",
-                BROWSER_START_TIMEOUT.as_secs(),
-                browser_stderr_preview(&stderr_path)
+                "Chromium DevTools startup timed out after {}s; binary={chromium_bin}; stderr_tail={stderr_tail}",
+                BROWSER_START_TIMEOUT.as_secs()
             )));
         }
     };
 
-    tracing::debug!(
+    tracing::info!(
         target: "synctv_media_providers::browser_session",
+        stage = "chromium_ready",
+        page_host = %page_host,
         chromium_bin = %chromium_bin,
+        browser_pid,
         debugging_port,
-        "Chromium browser CDP websocket ready"
+        elapsed_ms = startup_started.elapsed().as_millis(),
+        stderr_bytes = std::fs::metadata(&stderr_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or_default(),
+        "Authenticated browser page render diagnostics"
     );
+    log_container_resources("chromium_ready", page_host);
 
     Ok((
         ChromiumProcess {
@@ -407,28 +568,29 @@ fn chromium_binary() -> String {
     })
 }
 
-fn reserve_local_port() -> Result<u16, ProviderClientError> {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
-        .map_err(|error| ProviderClientError::Network(format!("reserve Chromium port: {error}")))?;
-    let port = listener
-        .local_addr()
-        .map_err(|error| ProviderClientError::Network(format!("read Chromium port: {error}")))?
-        .port();
-    drop(listener);
-    Ok(port)
+fn browser_devtools_active_port(profile_dir: &Path) -> Option<(String, u16)> {
+    let text = std::fs::read_to_string(profile_dir.join("DevToolsActivePort")).ok()?;
+    parse_devtools_active_port(&text)
 }
 
-fn read_limited_file(path: &Path, max_bytes: u64) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    let mut buffer = Vec::new();
-    let mut limited = file.take(max_bytes);
-    limited.read_to_end(&mut buffer).ok()?;
-    Some(String::from_utf8_lossy(&buffer).into_owned())
+fn parse_devtools_active_port(text: &str) -> Option<(String, u16)> {
+    let mut lines = text.lines();
+    let port = lines.next()?.trim().parse::<u16>().ok()?;
+    let endpoint = lines.next()?.trim();
+    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+        return Some((endpoint.to_string(), port));
+    }
+    if !endpoint.starts_with("/devtools/browser/") {
+        return None;
+    }
+    Some((format!("ws://127.0.0.1:{port}{endpoint}"), port))
 }
 
-fn browser_devtools_ws_url(path: &Path) -> Option<String> {
-    let text = read_limited_file(path, MAX_BROWSER_STDERR_SCAN_BYTES)?;
-    extract_devtools_ws_url(&text)
+fn browser_devtools_ws_from_stderr(path: &Path) -> Option<(String, u16)> {
+    let stderr_tail = browser_stderr_tail(path);
+    let browser_ws_url = extract_devtools_ws_url(&stderr_tail)?;
+    let port = Url::parse(&browser_ws_url).ok()?.port()?;
+    Some((browser_ws_url, port))
 }
 
 fn extract_devtools_ws_url(text: &str) -> Option<String> {
@@ -438,11 +600,29 @@ fn extract_devtools_ws_url(text: &str) -> Option<String> {
         .then(|| candidate.to_string())
 }
 
-fn browser_stderr_preview(path: &Path) -> String {
-    let Some(preview) = read_limited_file(path, MAX_BROWSER_STDERR_PREVIEW_BYTES) else {
+fn browser_stderr_tail(path: &Path) -> String {
+    let Ok(mut file) = std::fs::File::open(path) else {
         return "unavailable".to_string();
     };
-    let compact = preview.split_whitespace().collect::<Vec<_>>().join(" ");
+    let file_len = file.metadata().map(|metadata| metadata.len()).unwrap_or_default();
+    let start = file_len.saturating_sub(MAX_BROWSER_STDERR_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return "unavailable".to_string();
+    }
+
+    let mut buffer = Vec::new();
+    if file
+        .take(MAX_BROWSER_STDERR_TAIL_BYTES)
+        .read_to_end(&mut buffer)
+        .is_err()
+    {
+        return "unavailable".to_string();
+    }
+
+    let compact = String::from_utf8_lossy(&buffer)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if compact.is_empty() {
         "empty".to_string()
     } else {
@@ -532,14 +712,16 @@ async fn cdp_call(
         "method": method,
         "params": params,
     });
+
+    let started = Instant::now();
     socket
         .send(Message::text(payload.to_string()))
         .await
         .map_err(|error| {
-            ProviderClientError::Network(format!("send Chromium CDP command: {error}"))
+            ProviderClientError::Network(format!("send Chromium CDP command {method}: {error}"))
         })?;
 
-    tokio::time::timeout(CDP_COMMAND_TIMEOUT, async {
+    let result = tokio::time::timeout(CDP_COMMAND_TIMEOUT, async {
         loop {
             let message = socket
                 .next()
@@ -568,31 +750,132 @@ async fn cdp_call(
             return Ok(response.get("result").cloned().unwrap_or(Value::Null));
         }
     })
-    .await
-    .map_err(|_| ProviderClientError::Network(format!("Chromium CDP command {method} timed out")))?
+    .await;
+
+    match result {
+        Ok(inner) => {
+            tracing::debug!(
+                target: "synctv_media_providers::browser_session",
+                stage = "cdp_command",
+                method,
+                success = inner.is_ok(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "Chromium CDP command diagnostics"
+            );
+            inner
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "synctv_media_providers::browser_session",
+                stage = "cdp_command_timeout",
+                method,
+                elapsed_ms = started.elapsed().as_millis(),
+                "Chromium CDP command diagnostics"
+            );
+            Err(ProviderClientError::Network(format!(
+                "Chromium CDP command {method} timed out after {}s",
+                CDP_COMMAND_TIMEOUT.as_secs()
+            )))
+        }
+    }
 }
 
-async fn wait_for_page_ready(
+async fn cdp_call_best_effort(
     socket: &mut CdpSocket,
     command_id: &mut u64,
-) -> Result<(), ProviderClientError> {
-    for _ in 0..PAGE_READY_POLL_ATTEMPTS {
-        let result = cdp_call(
+    method: &str,
+    params: Value,
+    page_host: &str,
+) {
+    if let Err(error) = cdp_call(socket, command_id, method, params).await {
+        tracing::warn!(
+            target: "synctv_media_providers::browser_session",
+            stage = "cdp_optional_command_failed",
+            page_host = %page_host,
+            method,
+            error = %error,
+            "Chromium CDP optional optimization was not applied"
+        );
+    }
+}
+
+async fn wait_for_browser_signal(
+    socket: &mut CdpSocket,
+    command_id: &mut u64,
+    page_host: &str,
+) -> Result<BrowserProbeOutcome, ProviderClientError> {
+    let started = Instant::now();
+    let mut attempts = 0_usize;
+
+    loop {
+        attempts = attempts.saturating_add(1);
+        let evaluation = cdp_call(
             socket,
             command_id,
             "Runtime.evaluate",
             json!({
-                "expression": "document.readyState",
+                "expression": browser_probe_script(),
                 "returnByValue": true,
+                "awaitPromise": false,
             }),
         )
         .await?;
-        if result.pointer("/result/value").and_then(Value::as_str) == Some("complete") {
-            return Ok(());
+        let serialized = evaluation
+            .pointer("/result/value")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProviderClientError::Parse(
+                    "browser probe did not return a serialized value".to_string(),
+                )
+            })?;
+        let payload: BrowserProbePayload = serde_json::from_str(serialized)
+            .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
+
+        tracing::info!(
+            target: "synctv_media_providers::browser_session",
+            stage = "page_probe",
+            page_host = %page_host,
+            attempt = attempts,
+            elapsed_ms = started.elapsed().as_millis(),
+            ready_state = %payload.ready_state,
+            resource_count = payload.resource_count,
+            xhr_fetch_count = payload.xhr_fetch_count,
+            segment_like_count = payload.segment_like_count,
+            video_element_count = payload.video_element_count,
+            media_count = payload.media_urls.len(),
+            cgroup_memory_current_bytes = cgroup_memory_current_bytes().unwrap_or_default(),
+            self_rss_kib = process_rss_kib().unwrap_or_default(),
+            media_hosts = %summarize_media_hosts(&payload.media_urls),
+            media_kinds = %summarize_media_kinds(&payload.media_urls),
+            has_blob_video = payload.has_blob_video,
+            has_license_resource = payload.has_license_resource,
+            "Authenticated browser page render diagnostics"
+        );
+
+        let elapsed = started.elapsed();
+        let reason = if !payload.media_urls.is_empty() {
+            Some("media_url")
+        } else if payload.has_license_resource {
+            Some("license_resource")
+        } else if payload.has_blob_video && elapsed >= BLOB_VIDEO_GRACE_DELAY {
+            Some("blob_video")
+        } else if elapsed >= BROWSER_DISCOVERY_TIMEOUT {
+            Some("probe_timeout")
+        } else {
+            None
+        };
+
+        if let Some(reason) = reason {
+            return Ok(BrowserProbeOutcome {
+                payload,
+                reason,
+                attempts,
+                elapsed,
+            });
         }
-        tokio::time::sleep(PAGE_READY_POLL_INTERVAL).await;
+
+        tokio::time::sleep(BROWSER_PROBE_INTERVAL).await;
     }
-    Ok(())
 }
 
 fn chromium_cookie_param(cookie: &SessionCookie) -> Value {
@@ -675,6 +958,191 @@ fn normalize_media_urls(page_url: &Url, raw_urls: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+fn summarize_media_hosts(media_urls: &[String]) -> String {
+    let mut seen = HashSet::new();
+    let mut hosts = Vec::new();
+    for raw_url in media_urls {
+        let Some(host) = Url::parse(raw_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+        else {
+            continue;
+        };
+        if seen.insert(host.clone()) {
+            hosts.push(host);
+        }
+        if hosts.len() >= MAX_LOGGED_MEDIA_HOSTS {
+            break;
+        }
+    }
+    if hosts.is_empty() {
+        "none".to_string()
+    } else {
+        hosts.join(",")
+    }
+}
+
+fn summarize_media_kinds(media_urls: &[String]) -> String {
+    let mut m3u8 = 0_usize;
+    let mut mpd = 0_usize;
+    let mut mp4 = 0_usize;
+    let mut other = 0_usize;
+    for raw_url in media_urls {
+        let lower = raw_url.to_ascii_lowercase();
+        if lower.contains(".m3u8") {
+            m3u8 = m3u8.saturating_add(1);
+        } else if lower.contains(".mpd") {
+            mpd = mpd.saturating_add(1);
+        } else if lower.contains(".mp4") {
+            mp4 = mp4.saturating_add(1);
+        } else {
+            other = other.saturating_add(1);
+        }
+    }
+    format!("m3u8={m3u8},mpd={mpd},mp4={mp4},other={other}")
+}
+
+fn page_host(raw_url: &str) -> String {
+    Url::parse(raw_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+fn read_trimmed_file(path: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn cgroup_memory_current_bytes() -> Option<u64> {
+    read_trimmed_file("/sys/fs/cgroup/memory.current")
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| {
+            read_trimmed_file("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+}
+
+fn cgroup_memory_max() -> String {
+    read_trimmed_file("/sys/fs/cgroup/memory.max")
+        .or_else(|| read_trimmed_file("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn cgroup_memory_peak_bytes() -> Option<u64> {
+    read_trimmed_file("/sys/fs/cgroup/memory.peak")
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn cgroup_swap_current_bytes() -> Option<u64> {
+    read_trimmed_file("/sys/fs/cgroup/memory.swap.current")
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn cgroup_swap_max() -> String {
+    read_trimmed_file("/sys/fs/cgroup/memory.swap.max")
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn cgroup_memory_events() -> String {
+    read_trimmed_file("/sys/fs/cgroup/memory.events")
+        .map(|events| {
+            events
+                .lines()
+                .map(|line| line.split_whitespace().collect::<Vec<_>>().join("="))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn cgroup_cpu_max() -> String {
+    read_trimmed_file("/sys/fs/cgroup/cpu.max").unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn cgroup_cpu_stat() -> String {
+    read_trimmed_file("/sys/fs/cgroup/cpu.stat")
+        .map(|stats| {
+            stats
+                .lines()
+                .map(|line| line.split_whitespace().collect::<Vec<_>>().join("="))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn cgroup_pids_current() -> Option<u64> {
+    read_trimmed_file("/sys/fs/cgroup/pids.current")
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn cgroup_pids_max() -> String {
+    read_trimmed_file("/sys/fs/cgroup/pids.max").unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn process_rss_kib() -> Option<u64> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let value = line.strip_prefix("VmRSS:")?.trim();
+            value
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+}
+
+fn log_container_resources(stage: &'static str, page_host: &str) {
+    tracing::info!(
+        target: "synctv_media_providers::browser_session",
+        stage = stage,
+        page_host = %page_host,
+        cgroup_memory_current_bytes = cgroup_memory_current_bytes().unwrap_or_default(),
+        cgroup_memory_peak_bytes = cgroup_memory_peak_bytes().unwrap_or_default(),
+        cgroup_memory_max = %cgroup_memory_max(),
+        cgroup_swap_current_bytes = cgroup_swap_current_bytes().unwrap_or_default(),
+        cgroup_swap_max = %cgroup_swap_max(),
+        cgroup_memory_events = %cgroup_memory_events(),
+        cgroup_cpu_max = %cgroup_cpu_max(),
+        cgroup_cpu_stat = %cgroup_cpu_stat(),
+        cgroup_pids_current = cgroup_pids_current().unwrap_or_default(),
+        cgroup_pids_max = %cgroup_pids_max(),
+        self_rss_kib = process_rss_kib().unwrap_or_default(),
+        "Container resource diagnostics"
+    );
+}
+
+fn browser_probe_script() -> &'static str {
+    r#"(() => {
+        const resourceEntries = performance.getEntriesByType('resource');
+        const resources = resourceEntries.map((entry) => entry.name || '');
+        const mediaPattern = /\.(?:m3u8|mpd|mp4)(?:[?#]|$)/i;
+        const segmentPattern = /(?:\.m4s|\.ts)(?:[?#]|$)/i;
+        const mediaUrls = resources.filter((url) => mediaPattern.test(url));
+        const videoElements = Array.from(document.querySelectorAll('video'));
+        const sourceElements = Array.from(document.querySelectorAll('source'));
+        for (const element of [...videoElements, ...sourceElements]) {
+            const value = element.currentSrc || element.src || element.getAttribute('src') || '';
+            if (value && !value.startsWith('blob:') && !value.startsWith('data:')) {
+                mediaUrls.push(value);
+            }
+        }
+        return JSON.stringify({
+            readyState: document.readyState || '',
+            resourceCount: resources.length,
+            xhrFetchCount: resourceEntries.filter((entry) => entry.initiatorType === 'fetch' || entry.initiatorType === 'xmlhttprequest').length,
+            segmentLikeCount: resources.filter((url) => segmentPattern.test(url)).length,
+            videoElementCount: videoElements.length,
+            mediaUrls: Array.from(new Set(mediaUrls)),
+            hasBlobVideo: videoElements.some((element) => (element.currentSrc || element.src || '').startsWith('blob:')),
+            hasLicenseResource: resources.some((url) => /(widevine|playready|drm|license)/i.test(url))
+        });
+    })()"#
+}
+
 fn browser_observation_script() -> &'static str {
     r#"(() => {
         const resources = performance.getEntriesByType('resource').map((entry) => entry.name || '');
@@ -752,46 +1220,26 @@ mod tests {
     }
 
     #[test]
-    fn browser_render_cache_key_is_order_independent_and_session_scoped() {
-        let first = SessionCookie {
-            name: "P00001".to_string(),
-            value: "session-a".to_string(),
-            domain: ".iqiyi.com".to_string(),
-            path: "/".to_string(),
-            secure: true,
-            http_only: true,
-            session_only: false,
-            expires_at: Some(1_900_000_000),
-        };
-        let second = SessionCookie {
-            name: "QC005".to_string(),
-            value: "secondary".to_string(),
-            domain: ".iqiyi.com".to_string(),
-            path: "/".to_string(),
-            secure: true,
-            http_only: false,
-            session_only: true,
-            expires_at: None,
-        };
-        let url = "https://www.iqiyi.com/v_demo.html";
-        let forward = browser_render_cache_key(
-            url,
-            &["iqiyi.com", "qiyi.com"],
-            &[first.clone(), second.clone()],
+    fn parses_chromium_devtools_active_port_file() {
+        assert_eq!(
+            parse_devtools_active_port("44385\n/devtools/browser/abc\n"),
+            Some((
+                "ws://127.0.0.1:44385/devtools/browser/abc".to_string(),
+                44385
+            ))
         );
-        let reversed =
-            browser_render_cache_key(url, &["qiyi.com", "iqiyi.com"], &[second, first.clone()]);
-        assert_eq!(forward, reversed);
-
-        let mut changed = first;
-        changed.value = "session-b".to_string();
-        let changed_key = browser_render_cache_key(url, &["iqiyi.com", "qiyi.com"], &[changed]);
-        assert_ne!(forward, changed_key);
     }
 
     #[test]
-    fn extracts_browser_devtools_websocket_from_stderr() {
-        let text = "noise before\nDevTools listening on ws://127.0.0.1:44385/devtools/browser/abc\nnoise after";
+    fn rejects_incomplete_chromium_devtools_active_port_file() {
+        assert!(parse_devtools_active_port("44385\n").is_none());
+        assert!(parse_devtools_active_port("not-a-port\n/devtools/browser/abc\n").is_none());
+    }
+
+    #[test]
+    fn extracts_browser_devtools_websocket_from_stderr_tail() {
+        let text =
+            "dbus noise\nDevTools listening on ws://127.0.0.1:44385/devtools/browser/abc\nmore noise";
         assert_eq!(
             extract_devtools_ws_url(text).as_deref(),
             Some("ws://127.0.0.1:44385/devtools/browser/abc")
@@ -804,6 +1252,19 @@ mod tests {
             page_target_ws_url("ws://127.0.0.1:44385/devtools/browser/abc", "page-id")
                 .expect("page target URL"),
             "ws://127.0.0.1:44385/devtools/page/page-id"
+        );
+    }
+
+    #[test]
+    fn media_diagnostics_do_not_log_query_strings() {
+        let urls = vec![
+            "https://cdn-a.example/movie.m3u8?token=secret".to_string(),
+            "https://cdn-b.example/movie.mp4?authorization=secret".to_string(),
+        ];
+        assert_eq!(summarize_media_hosts(&urls), "cdn-a.example,cdn-b.example");
+        assert_eq!(
+            summarize_media_kinds(&urls),
+            "m3u8=1,mpd=0,mp4=1,other=0"
         );
     }
 }
