@@ -22,20 +22,15 @@ const BROWSER_RENDER_TIMEOUT: Duration = Duration::from_secs(22);
 const BROWSER_START_TIMEOUT: Duration = Duration::from_secs(12);
 const BROWSER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const BROWSER_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const BROWSER_PROFILE_CLEANUP_DELAY: Duration = Duration::from_millis(250);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
+const CDP_SLOW_COMMAND_THRESHOLD: Duration = Duration::from_millis(500);
 const BROWSER_PROBE_INTERVAL: Duration = Duration::from_millis(400);
 const BROWSER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(7);
 const BLOB_VIDEO_GRACE_DELAY: Duration = Duration::from_secs(3);
 const MAX_CONCURRENT_BROWSER_RENDERS: usize = 1;
 const MAX_BROWSER_STDERR_TAIL_BYTES: u64 = 16 * 1024;
 const MAX_LOGGED_MEDIA_HOSTS: usize = 5;
-const CDP_MAX_TOTAL_BUFFER_SIZE: u64 = 1_000_000;
-const CDP_MAX_RESOURCE_BUFFER_SIZE: u64 = 256_000;
-
-const BLOCKED_RESOURCE_URL_PATTERNS: &[&str] = &[
-    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg", "*.ico", "*.woff", "*.woff2",
-    "*.ttf", "*.otf",
-];
 
 static BROWSER_RENDER_SEMAPHORE: Semaphore = Semaphore::const_new(MAX_CONCURRENT_BROWSER_RENDERS);
 
@@ -98,20 +93,84 @@ struct BrowserProbeOutcome {
 
 struct ChromiumProcess {
     child: Child,
-    profile_dir: PathBuf,
+    profile_dir: Option<PathBuf>,
+    page_host: String,
 }
 
 impl ChromiumProcess {
     async fn shutdown(&mut self) {
-        let _ = self.child.kill().await;
-        let _ = tokio::fs::remove_dir_all(&self.profile_dir).await;
+        let started = Instant::now();
+        let kill_success = self.child.kill().await.is_ok();
+        let cleanup_success = if let Some(profile_dir) = self.profile_dir.take() {
+            match tokio::fs::remove_dir_all(&profile_dir).await {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "synctv_media_providers::browser_session",
+                        stage = "browser_profile_cleanup_failed",
+                        page_host = %self.page_host,
+                        error = %error,
+                        "Authenticated browser page render diagnostics"
+                    );
+                    false
+                }
+            }
+        } else {
+            true
+        };
+
+        tracing::info!(
+            target: "synctv_media_providers::browser_session",
+            stage = "browser_shutdown",
+            page_host = %self.page_host,
+            kill_success,
+            cleanup_success,
+            elapsed_ms = started.elapsed().as_millis(),
+            "Authenticated browser page render diagnostics"
+        );
     }
 }
 
 impl Drop for ChromiumProcess {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
-        let _ = std::fs::remove_dir_all(&self.profile_dir);
+        let Some(profile_dir) = self.profile_dir.take() else {
+            return;
+        };
+        let page_host = self.page_host.clone();
+
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                target: "synctv_media_providers::browser_session",
+                stage = "browser_abort_cleanup_not_scheduled",
+                page_host = %page_host,
+                "No Tokio runtime was available for non-blocking Chromium profile cleanup"
+            );
+            return;
+        };
+
+        tracing::info!(
+            target: "synctv_media_providers::browser_session",
+            stage = "browser_abort_cleanup_scheduled",
+            page_host = %page_host,
+            cleanup_delay_ms = BROWSER_PROFILE_CLEANUP_DELAY.as_millis(),
+            "Authenticated browser page render diagnostics"
+        );
+        runtime.spawn(async move {
+            tokio::time::sleep(BROWSER_PROFILE_CLEANUP_DELAY).await;
+            if let Err(error) = tokio::fs::remove_dir_all(&profile_dir).await {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        target: "synctv_media_providers::browser_session",
+                        stage = "browser_abort_cleanup_failed",
+                        page_host = %page_host,
+                        error = %error,
+                        "Deferred Chromium profile cleanup failed"
+                    );
+                }
+            }
+        });
     }
 }
 
@@ -164,25 +223,32 @@ pub async fn render_web_page_playback(
     );
 
     let render_started = Instant::now();
-    let result = tokio::time::timeout(
+    let result = match tokio::time::timeout(
         BROWSER_RENDER_TIMEOUT,
         render_web_page_playback_inner(raw_url, allowed_domains, cookies),
     )
     .await
-    .map_err(|_| {
-        tracing::warn!(
-            target: "synctv_media_providers::browser_session",
-            stage = "render_timeout",
-            page_host = %page_host,
-            render_elapsed_ms = render_started.elapsed().as_millis(),
-            total_elapsed_ms = request_started.elapsed().as_millis(),
-            "Authenticated browser page render diagnostics"
-        );
-        ProviderClientError::Network(format!(
-            "browser page rendering timed out after {}s",
-            BROWSER_RENDER_TIMEOUT.as_secs()
-        ))
-    })?;
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let elapsed = render_started.elapsed();
+            let overshoot = elapsed.saturating_sub(BROWSER_RENDER_TIMEOUT);
+            tracing::warn!(
+                target: "synctv_media_providers::browser_session",
+                stage = "render_timeout",
+                page_host = %page_host,
+                render_elapsed_ms = elapsed.as_millis(),
+                timeout_ms = BROWSER_RENDER_TIMEOUT.as_millis(),
+                timeout_overshoot_ms = overshoot.as_millis(),
+                total_elapsed_ms = request_started.elapsed().as_millis(),
+                "Authenticated browser page render diagnostics"
+            );
+            Err(ProviderClientError::Network(format!(
+                "browser page rendering timed out after {}s",
+                BROWSER_RENDER_TIMEOUT.as_secs()
+            )))
+        }
+    };
 
     drop(permit);
     log_container_resources("render_finished", &page_host);
@@ -264,47 +330,22 @@ async fn render_web_page_playback_inner(
             "Authenticated browser page render diagnostics"
         );
 
+        // Do not enable Page/Runtime/Network event domains. We only issue commands and
+        // inspect the rendered page through Runtime.evaluate. Enabling Network on a
+        // media-heavy site causes a large stream of CDP events that this low-memory
+        // fallback does not consume and needlessly burns CPU and websocket buffers.
         let mut command_id = 0_u64;
-        cdp_call(
-            &mut socket,
-            &mut command_id,
-            "Network.enable",
-            json!({
-                "maxTotalBufferSize": CDP_MAX_TOTAL_BUFFER_SIZE,
-                "maxResourceBufferSize": CDP_MAX_RESOURCE_BUFFER_SIZE,
-            }),
-        )
-        .await?;
-        cdp_call(&mut socket, &mut command_id, "Page.enable", json!({})).await?;
-        cdp_call(&mut socket, &mut command_id, "Runtime.enable", json!({})).await?;
-        cdp_call_best_effort(
-            &mut socket,
-            &mut command_id,
-            "Network.setCacheDisabled",
-            json!({ "cacheDisabled": true }),
-            &page_host,
-        )
-        .await;
-        cdp_call_best_effort(
-            &mut socket,
-            &mut command_id,
-            "Network.setBlockedURLs",
-            json!({ "urls": BLOCKED_RESOURCE_URL_PATTERNS }),
-            &page_host,
-        )
-        .await;
-
         tracing::info!(
             target: "synctv_media_providers::browser_session",
             stage = "cdp_configured",
             page_host = %page_host,
-            blocked_pattern_count = BLOCKED_RESOURCE_URL_PATTERNS.len(),
-            devtools_total_buffer_bytes = CDP_MAX_TOTAL_BUFFER_SIZE,
-            devtools_resource_buffer_bytes = CDP_MAX_RESOURCE_BUFFER_SIZE,
+            event_domains_enabled = false,
+            images_disabled = true,
             "Authenticated browser page render diagnostics"
         );
 
         if !cookies.is_empty() {
+            let cookie_started = Instant::now();
             let cookie_params = cookies
                 .iter()
                 .map(chromium_cookie_param)
@@ -321,6 +362,7 @@ async fn render_web_page_playback_inner(
                 stage = "cookies_installed",
                 page_host = %page_host,
                 cookie_count = cookies.len(),
+                elapsed_ms = cookie_started.elapsed().as_millis(),
                 "Authenticated browser page render diagnostics"
             );
         }
@@ -436,6 +478,7 @@ async fn start_chromium(
         .arg("--metrics-recording-only")
         .arg("--mute-audio")
         .arg("--hide-scrollbars")
+        .arg("--blink-settings=imagesEnabled=false")
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--no-service-autorun")
@@ -470,7 +513,9 @@ async fn start_chromium(
 
     let startup_started = Instant::now();
     let startup = tokio::time::timeout(BROWSER_START_TIMEOUT, async {
+        let mut poll_count = 0_u32;
         loop {
+            poll_count = poll_count.saturating_add(1);
             match child.try_wait() {
                 Ok(Some(status)) => {
                     return Err(ProviderClientError::Network(format!(
@@ -491,10 +536,14 @@ async fn start_chromium(
             {
                 return Ok((browser_ws_url, debugging_port));
             }
-            if let Some((browser_ws_url, debugging_port)) =
-                browser_devtools_ws_from_stderr(&stderr_path)
-            {
-                return Ok((browser_ws_url, debugging_port));
+            // DevToolsActivePort is the normal path. Stderr is only a fallback,
+            // so avoid synchronously re-reading a growing log every 100 ms.
+            if poll_count % 10 == 0 {
+                if let Some((browser_ws_url, debugging_port)) =
+                    browser_devtools_ws_from_stderr(&stderr_path)
+                {
+                    return Ok((browser_ws_url, debugging_port));
+                }
             }
 
             tokio::time::sleep(BROWSER_START_POLL_INTERVAL).await;
@@ -552,7 +601,8 @@ async fn start_chromium(
     Ok((
         ChromiumProcess {
             child,
-            profile_dir: profile_dir.to_path_buf(),
+            profile_dir: Some(profile_dir.to_path_buf()),
+            page_host: page_host.to_string(),
         },
         browser_ws_url,
     ))
@@ -754,14 +804,26 @@ async fn cdp_call(
 
     match result {
         Ok(inner) => {
-            tracing::debug!(
-                target: "synctv_media_providers::browser_session",
-                stage = "cdp_command",
-                method,
-                success = inner.is_ok(),
-                elapsed_ms = started.elapsed().as_millis(),
-                "Chromium CDP command diagnostics"
-            );
+            let elapsed = started.elapsed();
+            if elapsed >= CDP_SLOW_COMMAND_THRESHOLD {
+                tracing::info!(
+                    target: "synctv_media_providers::browser_session",
+                    stage = "cdp_command_slow",
+                    method,
+                    success = inner.is_ok(),
+                    elapsed_ms = elapsed.as_millis(),
+                    "Chromium CDP command diagnostics"
+                );
+            } else {
+                tracing::debug!(
+                    target: "synctv_media_providers::browser_session",
+                    stage = "cdp_command",
+                    method,
+                    success = inner.is_ok(),
+                    elapsed_ms = elapsed.as_millis(),
+                    "Chromium CDP command diagnostics"
+                );
+            }
             inner
         }
         Err(_) => {
@@ -777,25 +839,6 @@ async fn cdp_call(
                 CDP_COMMAND_TIMEOUT.as_secs()
             )))
         }
-    }
-}
-
-async fn cdp_call_best_effort(
-    socket: &mut CdpSocket,
-    command_id: &mut u64,
-    method: &str,
-    params: Value,
-    page_host: &str,
-) {
-    if let Err(error) = cdp_call(socket, command_id, method, params).await {
-        tracing::warn!(
-            target: "synctv_media_providers::browser_session",
-            stage = "cdp_optional_command_failed",
-            page_host = %page_host,
-            method,
-            error = %error,
-            "Chromium CDP optional optimization was not applied"
-        );
     }
 }
 
@@ -1095,7 +1138,53 @@ fn process_rss_kib() -> Option<u64> {
         })
 }
 
+#[derive(Debug, Default)]
+struct HostMemorySnapshot {
+    mem_total_kib: u64,
+    mem_available_kib: u64,
+    swap_total_kib: u64,
+    swap_free_kib: u64,
+}
+
+fn host_memory_snapshot() -> HostMemorySnapshot {
+    let Some(meminfo) = read_trimmed_file("/proc/meminfo") else {
+        return HostMemorySnapshot::default();
+    };
+    let mut snapshot = HostMemorySnapshot::default();
+    for line in meminfo.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let value = rest
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_default();
+        match key {
+            "MemTotal" => snapshot.mem_total_kib = value,
+            "MemAvailable" => snapshot.mem_available_kib = value,
+            "SwapTotal" => snapshot.swap_total_kib = value,
+            "SwapFree" => snapshot.swap_free_kib = value,
+            _ => {}
+        }
+    }
+    snapshot
+}
+
+fn pressure_summary(path: &str) -> String {
+    read_trimmed_file(path)
+        .map(|pressure| {
+            pressure
+                .lines()
+                .map(|line| line.split_whitespace().collect::<Vec<_>>().join(","))
+                .collect::<Vec<_>>()
+                .join(";")
+        })
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
 fn log_container_resources(stage: &'static str, page_host: &str) {
+    let host_memory = host_memory_snapshot();
     tracing::info!(
         target: "synctv_media_providers::browser_session",
         stage = stage,
@@ -1111,6 +1200,13 @@ fn log_container_resources(stage: &'static str, page_host: &str) {
         cgroup_pids_current = cgroup_pids_current().unwrap_or_default(),
         cgroup_pids_max = %cgroup_pids_max(),
         self_rss_kib = process_rss_kib().unwrap_or_default(),
+        host_mem_total_kib = host_memory.mem_total_kib,
+        host_mem_available_kib = host_memory.mem_available_kib,
+        host_swap_total_kib = host_memory.swap_total_kib,
+        host_swap_free_kib = host_memory.swap_free_kib,
+        psi_memory = %pressure_summary("/proc/pressure/memory"),
+        psi_cpu = %pressure_summary("/proc/pressure/cpu"),
+        psi_io = %pressure_summary("/proc/pressure/io"),
         "Container resource diagnostics"
     );
 }
