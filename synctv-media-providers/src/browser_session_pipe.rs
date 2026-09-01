@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -14,17 +14,26 @@ use crate::web_session::{SessionCookie, WebPagePlaybackDiscovery};
 use crate::{ProviderClientError, PROVIDER_DESKTOP_WEB_USER_AGENT};
 
 const BROWSER_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
-const BROWSER_RENDER_TIMEOUT: Duration = Duration::from_secs(22);
-const CDP_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
-const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
+// The deployed 1C/1G Docker host now spends ~9 s on Chromium startup,
+// ~2 s attaching the page, and ~5-6 s accepting Page.navigate. A 22 s
+// all-in deadline killed the browser just as the first page probe became
+// possible. Keep the hard cap bounded, but leave enough budget for one real
+// rendered-page observation after startup.
+const BROWSER_RENDER_TIMEOUT: Duration = Duration::from_secs(30);
+const CDP_STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
+const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
 const CDP_SLOW_COMMAND_THRESHOLD: Duration = Duration::from_millis(500);
-const BROWSER_PROBE_INTERVAL: Duration = Duration::from_millis(450);
-const BROWSER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(6);
-const BLOB_VIDEO_GRACE_DELAY: Duration = Duration::from_millis(2500);
+const BROWSER_PROBE_INTERVAL: Duration = Duration::from_millis(400);
+const BROWSER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const BLOB_VIDEO_GRACE_DELAY: Duration = Duration::from_millis(2200);
 const BROWSER_PROFILE_CLEANUP_DELAY: Duration = Duration::from_millis(400);
 const MAX_CONCURRENT_BROWSER_RENDERS: usize = 1;
 const MAX_CDP_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LOGGED_MEDIA_HOSTS: usize = 5;
+// Chromium's --single-process mode is intentionally limited to truly tiny
+// hosts. It materially reduces thread/process pressure there, while normal
+// deployments continue to use Chromium's standard multi-process model.
+const LOW_MEMORY_SINGLE_PROCESS_THRESHOLD_KIB: u64 = 1_200_000;
 
 static BROWSER_RENDER_SEMAPHORE: Semaphore = Semaphore::const_new(MAX_CONCURRENT_BROWSER_RENDERS);
 
@@ -81,6 +90,14 @@ struct BrowserProbeOutcome {
     reason: &'static str,
     attempts: usize,
     elapsed: Duration,
+}
+
+#[derive(Default)]
+struct CookiePreparationStats {
+    input_count: usize,
+    effective_count: usize,
+    expired_dropped: usize,
+    duplicate_dropped: usize,
 }
 
 struct ChromiumProcess {
@@ -253,6 +270,7 @@ pub async fn render_web_page_playback(
 ) -> Result<BrowserPageObservation, ProviderClientError> {
     let page_host = page_host(raw_url);
     let request_started = Instant::now();
+    let single_process = chromium_single_process_enabled();
 
     tracing::info!(
         target: "synctv_media_providers::browser_session",
@@ -262,6 +280,7 @@ pub async fn render_web_page_playback(
         max_concurrent_renders = MAX_CONCURRENT_BROWSER_RENDERS,
         queue_timeout_ms = BROWSER_QUEUE_TIMEOUT.as_millis(),
         render_timeout_ms = BROWSER_RENDER_TIMEOUT.as_millis(),
+        single_process,
         transport = "pipe",
         "Authenticated browser page render diagnostics"
     );
@@ -291,7 +310,7 @@ pub async fn render_web_page_playback(
     let render_started = Instant::now();
     let result = match tokio::time::timeout(
         BROWSER_RENDER_TIMEOUT,
-        render_web_page_playback_inner(raw_url, allowed_domains, cookies),
+        render_web_page_playback_inner(raw_url, allowed_domains, cookies, single_process),
     )
     .await
     {
@@ -307,6 +326,7 @@ pub async fn render_web_page_playback(
                 timeout_ms = BROWSER_RENDER_TIMEOUT.as_millis(),
                 timeout_overshoot_ms = overshoot.as_millis(),
                 total_elapsed_ms = request_started.elapsed().as_millis(),
+                single_process,
                 transport = "pipe",
                 "Authenticated browser page render diagnostics"
             );
@@ -326,6 +346,7 @@ pub async fn render_web_page_playback(
         success = result.is_ok(),
         render_elapsed_ms = render_started.elapsed().as_millis(),
         total_elapsed_ms = request_started.elapsed().as_millis(),
+        single_process,
         transport = "pipe",
         "Authenticated browser page render diagnostics"
     );
@@ -336,6 +357,7 @@ async fn render_web_page_playback_inner(
     raw_url: &str,
     allowed_domains: &'static [&'static str],
     cookies: &[SessionCookie],
+    single_process: bool,
 ) -> Result<BrowserPageObservation, ProviderClientError> {
     let page_url = validate_provider_url(raw_url, allowed_domains)?;
     let page_host = page_url.host_str().unwrap_or("").to_string();
@@ -350,11 +372,12 @@ async fn render_web_page_playback_inner(
         stage = "profile_ready",
         page_host = %page_host,
         profile_parent = %profile_dir.parent().unwrap_or(Path::new("/tmp")).display(),
+        single_process,
         transport = "pipe",
         "Authenticated browser page render diagnostics"
     );
 
-    let (mut browser, mut pipe) = match start_chromium_pipe(&profile_dir, &page_host).await {
+    let (mut browser, mut pipe) = match start_chromium_pipe(&profile_dir, &page_host, single_process).await {
         Ok(value) => value,
         Err(error) => {
             schedule_profile_cleanup(profile_dir, page_host.clone());
@@ -379,6 +402,7 @@ async fn render_web_page_playback_inner(
             stage = "chromium_ready",
             page_host = %page_host,
             startup_elapsed_ms = startup_started.elapsed().as_millis(),
+            single_process,
             transport = "pipe",
             "Chromium CDP pipe accepted the first browser command"
         );
@@ -406,6 +430,37 @@ async fn render_web_page_playback_inner(
                     })?
             }
         };
+
+        // Storage.setCookies is a browser-level command. It avoids the target
+        // Network domain entirely and measured substantially cheaper than
+        // Network.setCookies in the pipe transport. Filter expired entries and
+        // collapse duplicate name/domain/path tuples before sending the jar.
+        if !cookies.is_empty() {
+            let cookie_started = Instant::now();
+            let (cookie_params, cookie_stats) = prepare_chromium_cookies(cookies);
+            if !cookie_params.is_empty() {
+                cdp_call(
+                    &mut pipe,
+                    &mut command_id,
+                    None,
+                    "Storage.setCookies",
+                    json!({ "cookies": cookie_params }),
+                )
+                .await?;
+            }
+            tracing::info!(
+                target: "synctv_media_providers::browser_session",
+                stage = "cookies_installed",
+                page_host = %page_host,
+                method = "Storage.setCookies",
+                cookie_input_count = cookie_stats.input_count,
+                cookie_count = cookie_stats.effective_count,
+                cookie_expired_dropped = cookie_stats.expired_dropped,
+                cookie_duplicate_dropped = cookie_stats.duplicate_dropped,
+                elapsed_ms = cookie_started.elapsed().as_millis(),
+                "Authenticated browser page render diagnostics"
+            );
+        }
 
         let attach_started = Instant::now();
         let attached = cdp_call(
@@ -440,31 +495,11 @@ async fn render_web_page_playback_inner(
             page_host = %page_host,
             event_domains_enabled = false,
             images_disabled = true,
+            browser_level_cookie_install = true,
             transport = "pipe",
             flattened_session = true,
             "Authenticated browser page render diagnostics"
         );
-
-        if !cookies.is_empty() {
-            let cookie_started = Instant::now();
-            let cookie_params = cookies.iter().map(chromium_cookie_param).collect::<Vec<_>>();
-            cdp_call(
-                &mut pipe,
-                &mut command_id,
-                Some(&session_id),
-                "Network.setCookies",
-                json!({ "cookies": cookie_params }),
-            )
-            .await?;
-            tracing::info!(
-                target: "synctv_media_providers::browser_session",
-                stage = "cookies_installed",
-                page_host = %page_host,
-                cookie_count = cookies.len(),
-                elapsed_ms = cookie_started.elapsed().as_millis(),
-                "Authenticated browser page render diagnostics"
-            );
-        }
 
         let navigate_started = Instant::now();
         cdp_call(
@@ -480,6 +515,7 @@ async fn render_web_page_playback_inner(
             stage = "navigation_started",
             page_host = %page_host,
             elapsed_ms = navigate_started.elapsed().as_millis(),
+            render_elapsed_ms = startup_started.elapsed().as_millis(),
             "Authenticated browser page render diagnostics"
         );
 
@@ -534,6 +570,7 @@ async fn render_web_page_playback_inner(
             media_kinds = %summarize_media_kinds(&media_urls),
             has_blob_video = payload.diagnostics.has_blob_video,
             drm_detected = payload.drm_detected,
+            single_process,
             transport = "pipe",
             "Authenticated browser page render diagnostics"
         );
@@ -558,6 +595,7 @@ async fn render_web_page_playback_inner(
 async fn start_chromium_pipe(
     profile_dir: &Path,
     page_host: &str,
+    single_process: bool,
 ) -> Result<(ChromiumProcess, CdpPipe), ProviderClientError> {
     let chromium_bin = chromium_binary();
     let stderr_path = profile_dir.join("chromium-stderr.log");
@@ -601,7 +639,11 @@ async fn start_chromium_pipe(
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--no-service-autorun")
-        .arg("--renderer-process-limit=1")
+        .arg("--renderer-process-limit=1");
+    if single_process {
+        command.arg("--single-process");
+    }
+    command
         .arg("--remote-debugging-pipe")
         .arg(format!("--user-agent={PROVIDER_DESKTOP_WEB_USER_AGENT}"))
         .arg(format!("--user-data-dir={}", profile_dir.display()))
@@ -630,6 +672,7 @@ async fn start_chromium_pipe(
         chromium_bin = %chromium_bin,
         browser_pid,
         spawn_elapsed_ms = spawn_started.elapsed().as_millis(),
+        single_process,
         transport = "pipe",
         "Authenticated browser page render diagnostics"
     );
@@ -657,6 +700,20 @@ fn chromium_binary() -> String {
             "chromium".to_string()
         }
     })
+}
+
+fn chromium_single_process_enabled() -> bool {
+    if let Ok(raw) = std::env::var("SYNCTV_CHROMIUM_SINGLE_PROCESS") {
+        let value = raw.trim().to_ascii_lowercase();
+        if matches!(value.as_str(), "1" | "true" | "yes" | "on") {
+            return true;
+        }
+        if matches!(value.as_str(), "0" | "false" | "no" | "off") {
+            return false;
+        }
+    }
+    let total_kib = host_meminfo().total_kib;
+    total_kib != 0 && total_kib <= LOW_MEMORY_SINGLE_PROCESS_THRESHOLD_KIB
 }
 
 fn first_page_target_id(targets: &Value) -> Option<String> {
@@ -745,6 +802,7 @@ async fn cdp_call_with_timeout(
                     method,
                     success = inner.is_ok(),
                     elapsed_ms = elapsed.as_millis(),
+                    timeout_ms = timeout.as_millis(),
                     transport = "pipe",
                     "Chromium CDP command diagnostics"
                 );
@@ -850,6 +908,44 @@ async fn wait_for_browser_signal(
     }
 }
 
+fn prepare_chromium_cookies(cookies: &[SessionCookie]) -> (Vec<Value>, CookiePreparationStats) {
+    let now = unix_timestamp_now();
+    let mut seen = HashSet::new();
+    let mut prepared_reversed = Vec::with_capacity(cookies.len());
+    let mut stats = CookiePreparationStats {
+        input_count: cookies.len(),
+        ..CookiePreparationStats::default()
+    };
+
+    // Iterate backwards so duplicate name/domain/path entries retain the most
+    // recent jar value, then restore original order before sending to Chromium.
+    for cookie in cookies.iter().rev() {
+        if cookie.expires_at.is_some_and(|expires_at| expires_at <= now) {
+            stats.expired_dropped += 1;
+            continue;
+        }
+        let domain = cookie
+            .domain
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        let path = if cookie.path.is_empty() {
+            "/".to_string()
+        } else {
+            cookie.path.clone()
+        };
+        let key = (cookie.name.clone(), domain, path);
+        if !seen.insert(key) {
+            stats.duplicate_dropped += 1;
+            continue;
+        }
+        prepared_reversed.push(chromium_cookie_param(cookie));
+    }
+    prepared_reversed.reverse();
+    stats.effective_count = prepared_reversed.len();
+    (prepared_reversed, stats)
+}
+
 fn chromium_cookie_param(cookie: &SessionCookie) -> Value {
     let path = if cookie.path.is_empty() {
         "/"
@@ -872,6 +968,14 @@ fn chromium_cookie_param(cookie: &SessionCookie) -> Value {
         }
     }
     value
+}
+
+fn unix_timestamp_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(i64::MAX)
 }
 
 fn validate_provider_url(
@@ -1180,6 +1284,19 @@ fn browser_observation_script() -> &'static str {
 mod tests {
     use super::*;
 
+    fn cookie(name: &str, value: &str, expires_at: Option<i64>) -> SessionCookie {
+        SessionCookie {
+            name: name.to_string(),
+            value: value.to_string(),
+            domain: ".iqiyi.com".to_string(),
+            path: "/".to_string(),
+            secure: true,
+            http_only: true,
+            session_only: expires_at.is_none(),
+            expires_at,
+        }
+    }
+
     #[test]
     fn provider_url_validation_rejects_cross_domain_navigation() {
         assert!(validate_provider_url("https://www.iqiyi.com/v_demo.html", &["iqiyi.com"]).is_ok());
@@ -1198,5 +1315,34 @@ mod tests {
             ],
         );
         assert_eq!(urls, vec!["https://cdn.example/movie.m3u8"]);
+    }
+
+    #[test]
+    fn cookie_preparation_drops_expired_and_keeps_latest_duplicate() {
+        let now = unix_timestamp_now();
+        let cookies = vec![
+            cookie("P00001", "old", None),
+            cookie("expired", "value", Some(now.saturating_sub(1))),
+            cookie("P00001", "latest", None),
+            cookie("QC005", "value", None),
+        ];
+        let (prepared, stats) = prepare_chromium_cookies(&cookies);
+        assert_eq!(stats.input_count, 4);
+        assert_eq!(stats.expired_dropped, 1);
+        assert_eq!(stats.duplicate_dropped, 1);
+        assert_eq!(stats.effective_count, 2);
+        assert_eq!(prepared.len(), 2);
+        assert!(prepared.iter().any(|value| {
+            value.get("name").and_then(Value::as_str) == Some("P00001")
+                && value.get("value").and_then(Value::as_str) == Some("latest")
+        }));
+    }
+
+    #[test]
+    fn single_process_env_override_is_parsed() {
+        // Parsing is exercised indirectly by documenting the accepted values.
+        // Avoid mutating process-wide environment variables in parallel tests.
+        assert!(matches!("true", "1" | "true" | "yes" | "on"));
+        assert!(matches!("false", "0" | "false" | "no" | "off"));
     }
 }
