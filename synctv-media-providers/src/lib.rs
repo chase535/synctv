@@ -27,6 +27,7 @@ mod credential;
 pub mod acfun;
 pub mod alist;
 pub mod bilibili;
+#[path = "browser_session_cached.rs"]
 pub mod browser_session;
 pub mod cctv;
 pub mod cloudreve;
