@@ -20,7 +20,9 @@ use crate::{ProviderClientError, PROVIDER_DESKTOP_WEB_USER_AGENT};
 const BROWSER_QUEUE_TIMEOUT: Duration = Duration::from_secs(12);
 const BROWSER_RENDER_TIMEOUT: Duration = Duration::from_secs(22);
 const BROWSER_START_TIMEOUT: Duration = Duration::from_secs(12);
-const BROWSER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const BROWSER_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+const DEVTOOLS_HTTP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
+const DEVTOOLS_HTTP_RETRY_INTERVAL: Duration = Duration::from_millis(150);
 const BROWSER_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const BROWSER_PROFILE_CLEANUP_DELAY: Duration = Duration::from_millis(250);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
@@ -297,8 +299,15 @@ async fn render_web_page_playback_inner(
     };
 
     let result = async {
+        // Chromium already launches an about:blank page. Discover that target via
+        // DevTools' tiny loopback HTTP endpoint instead of first opening the
+        // browser-level websocket and issuing Target.getTargets. On a 1-core VPS,
+        // the extra browser websocket handshake was observed taking longer than
+        // the entire 3-second connect deadline even after DevToolsActivePort was
+        // ready. /json/list is substantially cheaper and returns the page websocket
+        // URL directly.
         let target_started = Instant::now();
-        let target_ws_url = find_page_target(&browser_ws_url).await?;
+        let target_ws_url = find_page_target(&browser_ws_url, &page_host).await?;
         tracing::info!(
             target: "synctv_media_providers::browser_session",
             stage = "page_target_ready",
@@ -341,6 +350,7 @@ async fn render_web_page_playback_inner(
             page_host = %page_host,
             event_domains_enabled = false,
             images_disabled = true,
+            target_discovery = "devtools_http",
             "Authenticated browser page render diagnostics"
         );
 
@@ -463,6 +473,7 @@ async fn start_chromium(
     command
         .arg("--headless=new")
         .arg("--no-sandbox")
+        .arg("--no-zygote")
         .arg("--disable-dev-shm-usage")
         .arg("--disable-gpu")
         .arg("--disable-background-networking")
@@ -680,73 +691,122 @@ fn browser_stderr_tail(path: &Path) -> String {
     }
 }
 
-async fn find_page_target(browser_ws_url: &str) -> Result<String, ProviderClientError> {
-    let (mut browser_socket, _) =
-        tokio::time::timeout(BROWSER_CONNECT_TIMEOUT, connect_async(browser_ws_url))
-            .await
-            .map_err(|_| {
-                ProviderClientError::Network(format!(
-                    "connect Chromium browser CDP timed out after {}s",
-                    BROWSER_CONNECT_TIMEOUT.as_secs()
-                ))
-            })?
-            .map_err(|error| {
-                ProviderClientError::Network(format!("connect Chromium browser CDP: {error}"))
-            })?;
-    let mut command_id = 0_u64;
-    let targets = cdp_call(
-        &mut browser_socket,
-        &mut command_id,
-        "Target.getTargets",
-        json!({}),
-    )
-    .await?;
-
-    let target_id = targets
-        .get("targetInfos")
-        .and_then(Value::as_array)
-        .and_then(|targets| {
-            targets
-                .iter()
-                .find(|target| target.get("type").and_then(Value::as_str) == Some("page"))
-        })
-        .and_then(|target| target.get("targetId"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-
-    let target_id = match target_id {
-        Some(target_id) => target_id,
-        None => cdp_call(
-            &mut browser_socket,
-            &mut command_id,
-            "Target.createTarget",
-            json!({ "url": "about:blank" }),
-        )
-        .await?
-        .get("targetId")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| {
-            ProviderClientError::Parse(
-                "Chromium Target.createTarget did not return targetId".to_string(),
-            )
-        })?,
-    };
-
-    page_target_ws_url(browser_ws_url, &target_id)
-}
-
-fn page_target_ws_url(
-    browser_ws_url: &str,
-    target_id: &str,
-) -> Result<String, ProviderClientError> {
+fn devtools_http_url(browser_ws_url: &str, path: &str) -> Result<Url, ProviderClientError> {
     let mut url = Url::parse(browser_ws_url).map_err(|error| {
         ProviderClientError::Parse(format!("invalid Chromium browser websocket URL: {error}"))
     })?;
-    url.set_path(&format!("/devtools/page/{target_id}"));
+    let http_scheme = match url.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        scheme => {
+            return Err(ProviderClientError::Parse(format!(
+                "unexpected Chromium DevTools websocket scheme: {scheme}"
+            )));
+        }
+    };
+    url.set_scheme(http_scheme).map_err(|()| {
+        ProviderClientError::Parse("failed to convert Chromium DevTools URL scheme".to_string())
+    })?;
+    url.set_path(path);
     url.set_query(None);
     url.set_fragment(None);
-    Ok(url.to_string())
+    Ok(url)
+}
+
+fn page_target_ws_from_json(targets: &Value) -> Option<String> {
+    targets.as_array()?.iter().find_map(|target| {
+        (target.get("type").and_then(Value::as_str) == Some("page"))
+            .then(|| target.get("webSocketDebuggerUrl").and_then(Value::as_str))
+            .flatten()
+            .map(str::to_string)
+    })
+}
+
+async fn find_page_target(
+    browser_ws_url: &str,
+    page_host: &str,
+) -> Result<String, ProviderClientError> {
+    let endpoint = devtools_http_url(browser_ws_url, "/json/list")?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(DEVTOOLS_HTTP_ATTEMPT_TIMEOUT)
+        .timeout(DEVTOOLS_HTTP_ATTEMPT_TIMEOUT)
+        .build()
+        .map_err(|error| {
+            ProviderClientError::Network(format!("build Chromium DevTools HTTP client: {error}"))
+        })?;
+
+    let started = Instant::now();
+    let mut attempts = 0_usize;
+    let mut last_error = "no DevTools page target returned".to_string();
+
+    loop {
+        attempts = attempts.saturating_add(1);
+        let attempt_started = Instant::now();
+        match client.get(endpoint.clone()).send().await {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => match response.json::<Value>().await {
+                    Ok(targets) => {
+                        let target_count = targets.as_array().map(Vec::len).unwrap_or_default();
+                        if let Some(target_ws_url) = page_target_ws_from_json(&targets) {
+                            tracing::info!(
+                                target: "synctv_media_providers::browser_session",
+                                stage = "devtools_target_list",
+                                page_host = %page_host,
+                                success = true,
+                                attempts,
+                                target_count,
+                                attempt_elapsed_ms = attempt_started.elapsed().as_millis(),
+                                elapsed_ms = started.elapsed().as_millis(),
+                                "Authenticated browser page render diagnostics"
+                            );
+                            return Ok(target_ws_url);
+                        }
+                        last_error = format!("DevTools returned {target_count} target(s) but no page target");
+                    }
+                    Err(error) => {
+                        last_error = format!("decode Chromium DevTools target list: {error}");
+                    }
+                },
+                Err(error) => {
+                    last_error = format!("Chromium DevTools target list HTTP status: {error}");
+                }
+            },
+            Err(error) => {
+                last_error = format!("query Chromium DevTools target list: {error}");
+            }
+        }
+
+        tracing::debug!(
+            target: "synctv_media_providers::browser_session",
+            stage = "devtools_target_list_retry",
+            page_host = %page_host,
+            attempts,
+            attempt_elapsed_ms = attempt_started.elapsed().as_millis(),
+            elapsed_ms = started.elapsed().as_millis(),
+            error = %last_error,
+            "Authenticated browser page render diagnostics"
+        );
+
+        if started.elapsed() >= BROWSER_CONNECT_TIMEOUT {
+            tracing::warn!(
+                target: "synctv_media_providers::browser_session",
+                stage = "devtools_target_list",
+                page_host = %page_host,
+                success = false,
+                attempts,
+                elapsed_ms = started.elapsed().as_millis(),
+                error = %last_error,
+                "Authenticated browser page render diagnostics"
+            );
+            return Err(ProviderClientError::Network(format!(
+                "discover Chromium page target timed out after {}s (attempts={attempts}): {last_error}",
+                BROWSER_CONNECT_TIMEOUT.as_secs()
+            )));
+        }
+
+        tokio::time::sleep(DEVTOOLS_HTTP_RETRY_INTERVAL).await;
+    }
 }
 
 async fn cdp_call(
@@ -1343,11 +1403,31 @@ mod tests {
     }
 
     #[test]
-    fn builds_page_target_websocket_from_browser_endpoint() {
+    fn builds_devtools_http_target_list_url_from_browser_endpoint() {
         assert_eq!(
-            page_target_ws_url("ws://127.0.0.1:44385/devtools/browser/abc", "page-id")
-                .expect("page target URL"),
-            "ws://127.0.0.1:44385/devtools/page/page-id"
+            devtools_http_url(
+                "ws://127.0.0.1:44385/devtools/browser/abc",
+                "/json/list"
+            )
+            .expect("DevTools HTTP URL")
+            .as_str(),
+            "http://127.0.0.1:44385/json/list"
+        );
+    }
+
+    #[test]
+    fn extracts_page_websocket_from_devtools_target_list() {
+        let targets = json!([
+            {
+                "id": "page-id",
+                "type": "page",
+                "url": "about:blank",
+                "webSocketDebuggerUrl": "ws://127.0.0.1:44385/devtools/page/page-id"
+            }
+        ]);
+        assert_eq!(
+            page_target_ws_from_json(&targets).as_deref(),
+            Some("ws://127.0.0.1:44385/devtools/page/page-id")
         );
     }
 
