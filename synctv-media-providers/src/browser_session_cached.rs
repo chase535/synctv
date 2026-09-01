@@ -1,5 +1,5 @@
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use moka::future::Cache;
 use sha2::{Digest, Sha256};
@@ -42,11 +42,14 @@ pub async fn render_web_page_playback(
     cookies: &[SessionCookie],
 ) -> Result<BrowserPageObservation, ProviderClientError> {
     let cache_key = browser_observation_cache_key(raw_url, allowed_domains, cookies);
+    let page_host = page_host(raw_url);
 
     if let Some(observation) = BROWSER_OBSERVATION_CACHE.get(&cache_key).await {
-        tracing::debug!(
+        tracing::info!(
             target: "synctv_media_providers::browser_session",
-            "Reusing short-lived authenticated browser page observation"
+            stage = "cache_hit",
+            page_host = %page_host,
+            "Authenticated browser page render diagnostics"
         );
         return Ok(observation);
     }
@@ -55,12 +58,34 @@ pub async fn render_web_page_playback(
     let cookies = cookies.to_vec();
     BROWSER_OBSERVATION_CACHE
         .try_get_with(cache_key, async move {
-            implementation::render_web_page_playback(&raw_url, allowed_domains, &cookies)
-                .await
-                .map_err(|error| error.to_string())
+            let started_at = Instant::now();
+            tracing::info!(
+                target: "synctv_media_providers::browser_session",
+                stage = "cache_miss_leader",
+                page_host = %page_host,
+                "Authenticated browser page render diagnostics"
+            );
+            let result =
+                implementation::render_web_page_playback(&raw_url, allowed_domains, &cookies).await;
+            tracing::info!(
+                target: "synctv_media_providers::browser_session",
+                stage = "render_complete",
+                page_host = %page_host,
+                success = result.is_ok(),
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "Authenticated browser page render diagnostics"
+            );
+            result.map_err(|error| error.to_string())
         })
         .await
         .map_err(|error| ProviderClientError::Network(error.as_ref().clone()))
+}
+
+fn page_host(raw_url: &str) -> String {
+    url::Url::parse(raw_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 fn browser_observation_cache_key(
@@ -148,5 +173,13 @@ mod tests {
             &[changed, second],
         );
         assert_ne!(forward, changed_key);
+    }
+
+    #[test]
+    fn browser_diagnostics_host_omits_path_and_query() {
+        assert_eq!(
+            page_host("https://www.iqiyi.com/v_demo.html?token=secret"),
+            "www.iqiyi.com"
+        );
     }
 }
