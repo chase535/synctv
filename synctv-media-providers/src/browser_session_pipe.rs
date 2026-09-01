@@ -14,11 +14,6 @@ use crate::web_session::{SessionCookie, WebPagePlaybackDiscovery};
 use crate::{ProviderClientError, PROVIDER_DESKTOP_WEB_USER_AGENT};
 
 const BROWSER_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
-// The deployed 1C/1G Docker host now spends ~9 s on Chromium startup,
-// ~2 s attaching the page, and ~5-6 s accepting Page.navigate. A 22 s
-// all-in deadline killed the browser just as the first page probe became
-// possible. Keep the hard cap bounded, but leave enough budget for one real
-// rendered-page observation after startup.
 const BROWSER_RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 const CDP_STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
@@ -30,9 +25,6 @@ const BROWSER_PROFILE_CLEANUP_DELAY: Duration = Duration::from_millis(400);
 const MAX_CONCURRENT_BROWSER_RENDERS: usize = 1;
 const MAX_CDP_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LOGGED_MEDIA_HOSTS: usize = 5;
-// Chromium's --single-process mode is intentionally limited to truly tiny
-// hosts. It materially reduces thread/process pressure there, while normal
-// deployments continue to use Chromium's standard multi-process model.
 const LOW_MEMORY_SINGLE_PROCESS_THRESHOLD_KIB: u64 = 1_200_000;
 
 static BROWSER_RENDER_SEMAPHORE: Semaphore = Semaphore::const_new(MAX_CONCURRENT_BROWSER_RENDERS);
@@ -80,9 +72,30 @@ struct BrowserProbePayload {
     xhr_fetch_count: usize,
     segment_like_count: usize,
     video_element_count: usize,
+    video_with_current_src_count: usize,
+    video_with_src_attr_count: usize,
+    video_paused_count: usize,
+    video_error_count: usize,
+    video_ready_state_max: usize,
+    video_network_state_max: usize,
     media_urls: Vec<String>,
+    resource_host_kinds: Vec<String>,
     has_blob_video: bool,
     has_license_resource: bool,
+    play_attempted: bool,
+    play_pending: bool,
+    play_fulfilled: bool,
+    play_rejected: bool,
+    play_error_name: String,
+    visibility_state: String,
+    document_has_focus: bool,
+    viewport_width: usize,
+    viewport_height: usize,
+    mse_h264_supported: bool,
+    mse_aac_supported: bool,
+    video_h264_can_play: bool,
+    navigator_webdriver: bool,
+    eme_available: bool,
 }
 
 struct BrowserProbeOutcome {
@@ -242,13 +255,11 @@ impl CdpPipe {
                 return serde_json::from_slice(payload)
                     .map_err(|error| ProviderClientError::Parse(error.to_string()));
             }
-
             if self.buffered.len() >= MAX_CDP_MESSAGE_BYTES {
                 return Err(ProviderClientError::Network(format!(
                     "Chromium CDP pipe frame exceeded {MAX_CDP_MESSAGE_BYTES} bytes"
                 )));
             }
-
             let mut chunk = [0_u8; 8192];
             let read = self.output.read(&mut chunk).await.map_err(|error| {
                 ProviderClientError::Network(format!("read Chromium CDP pipe: {error}"))
@@ -298,7 +309,6 @@ pub async fn render_web_page_playback(
         .map_err(|error| {
             ProviderClientError::Network(format!("browser discovery semaphore closed: {error}"))
         })?;
-
     tracing::info!(
         target: "synctv_media_providers::browser_session",
         stage = "browser_slot_acquired",
@@ -431,10 +441,6 @@ async fn render_web_page_playback_inner(
             }
         };
 
-        // Storage.setCookies is a browser-level command. It avoids the target
-        // Network domain entirely and measured substantially cheaper than
-        // Network.setCookies in the pipe transport. Filter expired entries and
-        // collapse duplicate name/domain/path tuples before sending the jar.
         if !cookies.is_empty() {
             let cookie_started = Instant::now();
             let (cookie_params, cookie_stats) = prepare_chromium_cookies(cookies);
@@ -488,7 +494,6 @@ async fn render_web_page_playback_inner(
             transport = "pipe",
             "Authenticated browser page render diagnostics"
         );
-
         tracing::info!(
             target: "synctv_media_providers::browser_session",
             stage = "cdp_configured",
@@ -496,6 +501,7 @@ async fn render_web_page_playback_inner(
             event_domains_enabled = false,
             images_disabled = true,
             browser_level_cookie_install = true,
+            interactive_probe = true,
             transport = "pipe",
             flattened_session = true,
             "Authenticated browser page render diagnostics"
@@ -536,7 +542,7 @@ async fn render_web_page_playback_inner(
             json!({
                 "expression": browser_observation_script(),
                 "returnByValue": true,
-                "awaitPromise": true,
+                "awaitPromise": false,
             }),
         )
         .await?;
@@ -570,6 +576,11 @@ async fn render_web_page_playback_inner(
             media_kinds = %summarize_media_kinds(&media_urls),
             has_blob_video = payload.diagnostics.has_blob_video,
             drm_detected = payload.drm_detected,
+            play_attempted = probe.payload.play_attempted,
+            play_pending = probe.payload.play_pending,
+            play_fulfilled = probe.payload.play_fulfilled,
+            play_rejected = probe.payload.play_rejected,
+            play_error_name = %probe.payload.play_error_name,
             single_process,
             transport = "pipe",
             "Authenticated browser page render diagnostics"
@@ -598,16 +609,10 @@ async fn start_chromium_pipe(
     single_process: bool,
 ) -> Result<(ChromiumProcess, CdpPipe), ProviderClientError> {
     let chromium_bin = chromium_binary();
-    let stderr_path = profile_dir.join("chromium-stderr.log");
-    let stderr_file = std::fs::File::create(&stderr_path).map_err(|error| {
+    let stderr_file = std::fs::File::create(profile_dir.join("chromium-stderr.log")).map_err(|error| {
         ProviderClientError::Network(format!("create Chromium stderr log: {error}"))
     })?;
 
-    // Chromium's --remote-debugging-pipe protocol uses file descriptors 3 and 4.
-    // The small POSIX shell wrapper duplicates the child's stdin/stdout to those
-    // descriptors before exec'ing Chromium. This avoids TCP, HTTP /json/list and
-    // WebSocket handshakes entirely, which are disproportionately expensive and
-    // unreliable on the target 1-core / ~1 GB Docker host.
     let mut command = Command::new("/bin/sh");
     command
         .arg("-c")
@@ -777,8 +782,7 @@ async fn cdp_call_with_timeout(
                 continue;
             }
             if let Some(expected_session) = session_id {
-                let actual_session = response.get("sessionId").and_then(Value::as_str);
-                if actual_session != Some(expected_session) {
+                if response.get("sessionId").and_then(Value::as_str) != Some(expected_session) {
                     continue;
                 }
             }
@@ -847,6 +851,7 @@ async fn wait_for_browser_signal(
                 "expression": browser_probe_script(),
                 "returnByValue": true,
                 "awaitPromise": false,
+                "userGesture": true,
             }),
         )
         .await?;
@@ -872,13 +877,34 @@ async fn wait_for_browser_signal(
             xhr_fetch_count = payload.xhr_fetch_count,
             segment_like_count = payload.segment_like_count,
             video_element_count = payload.video_element_count,
+            video_with_current_src_count = payload.video_with_current_src_count,
+            video_with_src_attr_count = payload.video_with_src_attr_count,
+            video_paused_count = payload.video_paused_count,
+            video_error_count = payload.video_error_count,
+            video_ready_state_max = payload.video_ready_state_max,
+            video_network_state_max = payload.video_network_state_max,
             media_count = payload.media_urls.len(),
-            cgroup_memory_current_bytes = cgroup_memory_current_bytes().unwrap_or_default(),
-            self_rss_kib = process_rss_kib().unwrap_or_default(),
             media_hosts = %summarize_media_hosts(&payload.media_urls),
             media_kinds = %summarize_media_kinds(&payload.media_urls),
+            resource_host_kinds = %payload.resource_host_kinds.join(","),
             has_blob_video = payload.has_blob_video,
             has_license_resource = payload.has_license_resource,
+            play_attempted = payload.play_attempted,
+            play_pending = payload.play_pending,
+            play_fulfilled = payload.play_fulfilled,
+            play_rejected = payload.play_rejected,
+            play_error_name = %payload.play_error_name,
+            visibility_state = %payload.visibility_state,
+            document_has_focus = payload.document_has_focus,
+            viewport_width = payload.viewport_width,
+            viewport_height = payload.viewport_height,
+            mse_h264_supported = payload.mse_h264_supported,
+            mse_aac_supported = payload.mse_aac_supported,
+            video_h264_can_play = payload.video_h264_can_play,
+            navigator_webdriver = payload.navigator_webdriver,
+            eme_available = payload.eme_available,
+            cgroup_memory_current_bytes = cgroup_memory_current_bytes().unwrap_or_default(),
+            self_rss_kib = process_rss_kib().unwrap_or_default(),
             transport = "pipe",
             "Authenticated browser page render diagnostics"
         );
@@ -917,8 +943,6 @@ fn prepare_chromium_cookies(cookies: &[SessionCookie]) -> (Vec<Value>, CookiePre
         ..CookiePreparationStats::default()
     };
 
-    // Iterate backwards so duplicate name/domain/path entries retain the most
-    // recent jar value, then restore original order before sending to Chromium.
     for cookie in cookies.iter().rev() {
         if cookie.expires_at.is_some_and(|expires_at| expires_at <= now) {
             stats.expired_dropped += 1;
@@ -1214,25 +1238,106 @@ fn log_container_resources(stage: &'static str, page_host: &str) {
 fn browser_probe_script() -> &'static str {
     r#"(() => {
         const entries = performance.getEntriesByType('resource');
-        const resources = entries.map((entry) => entry.name || '');
         const mediaPattern = /\.(?:m3u8|mpd|mp4)(?:[?#]|$)/i;
         const segmentPattern = /(?:\.m4s|\.ts)(?:[?#]|$)/i;
-        const mediaUrls = resources.filter((url) => mediaPattern.test(url));
+        const mediaInitiators = new Set(['video', 'audio', 'media']);
+        const resources = entries.map((entry) => ({
+            name: entry.name || '',
+            initiator: entry.initiatorType || 'other'
+        }));
+        const mediaUrls = resources
+            .filter((entry) => mediaPattern.test(entry.name) || mediaInitiators.has(entry.initiator))
+            .map((entry) => entry.name);
         const videos = Array.from(document.querySelectorAll('video'));
         const sources = Array.from(document.querySelectorAll('source'));
         for (const element of [...videos, ...sources]) {
             const value = element.currentSrc || element.src || element.getAttribute('src') || '';
             if (value && !value.startsWith('blob:') && !value.startsWith('data:')) mediaUrls.push(value);
         }
+
+        const state = window.__synctvPlaybackProbeState || (window.__synctvPlaybackProbeState = {
+            playAttempted: false,
+            playPending: false,
+            playFulfilled: false,
+            playRejected: false,
+            playErrorName: ''
+        });
+        if (videos.length > 0 && !state.playAttempted) {
+            const candidate = videos.find((video) => video.currentSrc || video.src || video.querySelector('source')) || videos[0];
+            state.playAttempted = true;
+            state.playPending = true;
+            candidate.muted = true;
+            candidate.autoplay = true;
+            try {
+                const result = candidate.play();
+                if (result && typeof result.then === 'function') {
+                    result.then(() => {
+                        state.playPending = false;
+                        state.playFulfilled = true;
+                    }).catch((error) => {
+                        state.playPending = false;
+                        state.playRejected = true;
+                        state.playErrorName = error && error.name ? String(error.name) : 'Error';
+                    });
+                } else {
+                    state.playPending = false;
+                    state.playFulfilled = true;
+                }
+            } catch (error) {
+                state.playPending = false;
+                state.playRejected = true;
+                state.playErrorName = error && error.name ? String(error.name) : 'Error';
+            }
+        }
+
+        const hostCounts = new Map();
+        for (const entry of resources) {
+            try {
+                const host = new URL(entry.name, location.href).hostname;
+                if (!host) continue;
+                const key = `${host}|${entry.initiator}`;
+                hostCounts.set(key, (hostCounts.get(key) || 0) + 1);
+            } catch (_) {}
+        }
+        const resourceHostKinds = Array.from(hostCounts.entries())
+            .sort((left, right) => right[1] - left[1])
+            .slice(0, 8)
+            .map(([key, count]) => `${key}=${count}`);
+
+        const h264 = 'video/mp4; codecs="avc1.42E01E"';
+        const aac = 'audio/mp4; codecs="mp4a.40.2"';
+        const codecVideo = document.createElement('video');
+        const hasMediaSource = typeof MediaSource !== 'undefined';
         return JSON.stringify({
             readyState: document.readyState || '',
             resourceCount: resources.length,
-            xhrFetchCount: entries.filter((entry) => entry.initiatorType === 'fetch' || entry.initiatorType === 'xmlhttprequest').length,
-            segmentLikeCount: resources.filter((url) => segmentPattern.test(url)).length,
+            xhrFetchCount: resources.filter((entry) => entry.initiator === 'fetch' || entry.initiator === 'xmlhttprequest').length,
+            segmentLikeCount: resources.filter((entry) => segmentPattern.test(entry.name)).length,
             videoElementCount: videos.length,
+            videoWithCurrentSrcCount: videos.filter((video) => !!video.currentSrc).length,
+            videoWithSrcAttrCount: videos.filter((video) => !!(video.getAttribute('src') || video.src)).length,
+            videoPausedCount: videos.filter((video) => video.paused).length,
+            videoErrorCount: videos.filter((video) => !!video.error).length,
+            videoReadyStateMax: videos.reduce((value, video) => Math.max(value, Number(video.readyState) || 0), 0),
+            videoNetworkStateMax: videos.reduce((value, video) => Math.max(value, Number(video.networkState) || 0), 0),
             mediaUrls: Array.from(new Set(mediaUrls)),
-            hasBlobVideo: videos.some((element) => (element.currentSrc || element.src || '').startsWith('blob:')),
-            hasLicenseResource: resources.some((url) => /(widevine|playready|drm|license)/i.test(url))
+            resourceHostKinds,
+            hasBlobVideo: videos.some((video) => (video.currentSrc || video.src || '').startsWith('blob:')),
+            hasLicenseResource: resources.some((entry) => /(widevine|playready|drm|license)/i.test(entry.name)),
+            playAttempted: !!state.playAttempted,
+            playPending: !!state.playPending,
+            playFulfilled: !!state.playFulfilled,
+            playRejected: !!state.playRejected,
+            playErrorName: state.playErrorName || '',
+            visibilityState: document.visibilityState || '',
+            documentHasFocus: typeof document.hasFocus === 'function' ? document.hasFocus() : false,
+            viewportWidth: Math.max(0, Number(window.innerWidth) || 0),
+            viewportHeight: Math.max(0, Number(window.innerHeight) || 0),
+            mseH264Supported: hasMediaSource && MediaSource.isTypeSupported(h264),
+            mseAacSupported: hasMediaSource && MediaSource.isTypeSupported(aac),
+            videoH264CanPlay: !!codecVideo.canPlayType(h264),
+            navigatorWebdriver: navigator.webdriver === true,
+            emeAvailable: typeof navigator.requestMediaKeySystemAccess === 'function'
         });
     })()"#
 }
@@ -1240,39 +1345,51 @@ fn browser_probe_script() -> &'static str {
 fn browser_observation_script() -> &'static str {
     r#"(() => {
         const entries = performance.getEntriesByType('resource');
-        const resources = entries.map((entry) => entry.name || '');
         const mediaPattern = /\.(?:m3u8|mpd|mp4)(?:[?#]|$)/i;
-        const mediaUrls = resources.filter((url) => mediaPattern.test(url));
+        const mediaInitiators = new Set(['video', 'audio', 'media']);
+        const resources = entries.map((entry) => ({
+            name: entry.name || '',
+            initiator: entry.initiatorType || 'other'
+        }));
+        const mediaUrls = resources
+            .filter((entry) => mediaPattern.test(entry.name) || mediaInitiators.has(entry.initiator))
+            .map((entry) => entry.name);
         const videos = Array.from(document.querySelectorAll('video'));
         const sources = Array.from(document.querySelectorAll('source'));
         for (const element of [...videos, ...sources]) {
             const value = element.currentSrc || element.src || element.getAttribute('src') || '';
             if (value && !value.startsWith('blob:') && !value.startsWith('data:')) mediaUrls.push(value);
         }
-        const html = document.documentElement ? document.documentElement.outerHTML : '';
-        const lower = html.toLowerCase();
-        const joinedResources = resources.join('\n').toLowerCase();
+        const scriptText = Array.from(document.scripts)
+            .map((script) => script.textContent || '')
+            .join('\n')
+            .toLowerCase();
+        const bodyText = (document.body && document.body.innerText ? document.body.innerText : '').toLowerCase();
+        const markerText = `${scriptText}\n${bodyText}`;
         const hasDrmMarker = ['widevine','playready','fairplay','com.widevine.alpha','licenseurl','license_url','drmlicense']
-            .some((marker) => lower.includes(marker));
-        const hasLicenseResource = /(widevine|playready|drm|license)/i.test(joinedResources);
+            .some((marker) => markerText.includes(marker));
+        const hasLicenseResource = resources.some((entry) => /(widevine|playready|drm|license)/i.test(entry.name));
+        const htmlLength = document.documentElement && document.documentElement.innerHTML
+            ? document.documentElement.innerHTML.length
+            : 0;
         return JSON.stringify({
             currentUrl: location.href,
             title: document.title || '',
             mediaUrls: Array.from(new Set(mediaUrls)),
             drmDetected: hasDrmMarker || hasLicenseResource,
             diagnostics: {
-                readyState: document.readyState,
-                htmlLength: html.length,
+                readyState: document.readyState || '',
+                htmlLength,
                 resourceCount: resources.length,
-                mediaResourceCount: resources.filter((url) => mediaPattern.test(url)).length,
+                mediaResourceCount: resources.filter((entry) => mediaPattern.test(entry.name) || mediaInitiators.has(entry.initiator)).length,
                 videoElementCount: videos.length,
                 sourceElementCount: sources.length,
-                hasM3u8: lower.includes('.m3u8') || resources.some((url) => /\.m3u8(?:[?#]|$)/i.test(url)),
-                hasMpd: lower.includes('.mpd') || resources.some((url) => /\.mpd(?:[?#]|$)/i.test(url)),
-                hasMp4: lower.includes('.mp4') || resources.some((url) => /\.mp4(?:[?#]|$)/i.test(url)),
-                hasBlobVideo: videos.some((element) => (element.currentSrc || element.src || '').startsWith('blob:')),
-                hasVideoId: /(?:videoid|video_id|vid)[\"'\s:=]/i.test(html),
-                hasTvId: /(?:tvid|tv_id)[\"'\s:=]/i.test(html),
+                hasM3u8: markerText.includes('.m3u8') || resources.some((entry) => /\.m3u8(?:[?#]|$)/i.test(entry.name)),
+                hasMpd: markerText.includes('.mpd') || resources.some((entry) => /\.mpd(?:[?#]|$)/i.test(entry.name)),
+                hasMp4: markerText.includes('.mp4') || resources.some((entry) => /\.mp4(?:[?#]|$)/i.test(entry.name)),
+                hasBlobVideo: videos.some((video) => (video.currentSrc || video.src || '').startsWith('blob:')),
+                hasVideoId: /(?:videoid|video_id|vid)[\"'\s:=]/i.test(markerText),
+                hasTvId: /(?:tvid|tv_id)[\"'\s:=]/i.test(markerText),
                 hasDrmMarker,
                 hasLicenseResource
             }
@@ -1339,10 +1456,10 @@ mod tests {
     }
 
     #[test]
-    fn single_process_env_override_is_parsed() {
-        // Parsing is exercised indirectly by documenting the accepted values.
-        // Avoid mutating process-wide environment variables in parallel tests.
-        assert!(matches!("true", "1" | "true" | "yes" | "on"));
-        assert!(matches!("false", "0" | "false" | "no" | "off"));
+    fn probe_script_never_logs_resource_paths_or_cookie_values() {
+        let script = browser_probe_script();
+        assert!(script.contains("hostname"));
+        assert!(!script.contains("document.cookie"));
+        assert!(!script.contains("location.search"));
     }
 }
