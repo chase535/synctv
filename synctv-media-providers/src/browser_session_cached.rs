@@ -12,7 +12,7 @@ pub use implementation::{BrowserPageDiagnostics, BrowserPageObservation};
 use crate::web_session::SessionCookie;
 use crate::ProviderClientError;
 
-const BROWSER_OBSERVATION_CACHE_CAPACITY: u64 = 128;
+const BROWSER_OBSERVATION_CACHE_CAPACITY: u64 = 16;
 const BROWSER_OBSERVATION_CACHE_TTL: Duration = Duration::from_secs(10);
 
 static BROWSER_OBSERVATION_CACHE: LazyLock<Cache<String, BrowserPageObservation>> =
@@ -49,6 +49,10 @@ pub async fn render_web_page_playback(
             target: "synctv_media_providers::browser_session",
             stage = "cache_hit",
             page_host = %page_host,
+            media_count = observation.discovery.media_urls.len(),
+            drm_detected = observation.discovery.drm_detected,
+            ready_state = %observation.diagnostics.ready_state,
+            has_blob_video = observation.diagnostics.has_blob_video,
             "Authenticated browser page render diagnostics"
         );
         return Ok(observation);
@@ -63,18 +67,38 @@ pub async fn render_web_page_playback(
                 target: "synctv_media_providers::browser_session",
                 stage = "cache_miss_leader",
                 page_host = %page_host,
+                cache_capacity = BROWSER_OBSERVATION_CACHE_CAPACITY,
+                cache_ttl_secs = BROWSER_OBSERVATION_CACHE_TTL.as_secs(),
                 "Authenticated browser page render diagnostics"
             );
+
             let result =
                 implementation::render_web_page_playback(&raw_url, allowed_domains, &cookies).await;
-            tracing::info!(
-                target: "synctv_media_providers::browser_session",
-                stage = "render_complete",
-                page_host = %page_host,
-                success = result.is_ok(),
-                elapsed_ms = started_at.elapsed().as_millis(),
-                "Authenticated browser page render diagnostics"
-            );
+
+            match &result {
+                Ok(observation) => tracing::info!(
+                    target: "synctv_media_providers::browser_session",
+                    stage = "render_complete",
+                    page_host = %page_host,
+                    success = true,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    media_count = observation.discovery.media_urls.len(),
+                    drm_detected = observation.discovery.drm_detected,
+                    ready_state = %observation.diagnostics.ready_state,
+                    has_blob_video = observation.diagnostics.has_blob_video,
+                    "Authenticated browser page render diagnostics"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "synctv_media_providers::browser_session",
+                    stage = "render_complete",
+                    page_host = %page_host,
+                    success = false,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    error = %error,
+                    "Authenticated browser page render diagnostics"
+                ),
+            }
+
             result.map_err(|error| error.to_string())
         })
         .await
