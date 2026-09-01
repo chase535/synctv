@@ -85,13 +85,14 @@ pub async fn render_web_page_playback(
     let raw_url = raw_url.to_string();
     let cookies = cookies.to_vec();
     let key_for_failure = cache_key.clone();
+    let render_page_host = page_host.clone();
     let result = BROWSER_OBSERVATION_CACHE
         .try_get_with(cache_key, async move {
             let started_at = Instant::now();
             tracing::info!(
                 target: "synctv_media_providers::browser_session",
                 stage = "cache_miss_leader",
-                page_host = %page_host,
+                page_host = %render_page_host,
                 cache_capacity = BROWSER_OBSERVATION_CACHE_CAPACITY,
                 cache_ttl_secs = BROWSER_OBSERVATION_CACHE_TTL.as_secs(),
                 failure_backoff_secs = BROWSER_FAILURE_BACKOFF_TTL.as_secs(),
@@ -105,7 +106,7 @@ pub async fn render_web_page_playback(
                 Ok(observation) => tracing::info!(
                     target: "synctv_media_providers::browser_session",
                     stage = "render_complete",
-                    page_host = %page_host,
+                    page_host = %render_page_host,
                     success = true,
                     elapsed_ms = started_at.elapsed().as_millis(),
                     media_count = observation.discovery.media_urls.len(),
@@ -117,7 +118,7 @@ pub async fn render_web_page_playback(
                 Err(error) => tracing::warn!(
                     target: "synctv_media_providers::browser_session",
                     stage = "render_complete",
-                    page_host = %page_host,
+                    page_host = %render_page_host,
                     success = false,
                     elapsed_ms = started_at.elapsed().as_millis(),
                     error = %error,
