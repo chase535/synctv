@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use moka::future::Cache;
 use sha2::{Digest, Sha256};
 
-#[path = "browser_session_lowmem.rs"]
+#[path = "browser_session_pipe.rs"]
 mod implementation;
 
 pub use implementation::{BrowserPageDiagnostics, BrowserPageObservation};
