@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use moka::future::Cache;
 use sha2::{Digest, Sha256};
 
-#[path = "browser_session.rs"]
+#[path = "browser_session_lowmem.rs"]
 mod implementation;
 
 pub use implementation::{BrowserPageDiagnostics, BrowserPageObservation};
@@ -14,6 +14,8 @@ use crate::ProviderClientError;
 
 const BROWSER_OBSERVATION_CACHE_CAPACITY: u64 = 16;
 const BROWSER_OBSERVATION_CACHE_TTL: Duration = Duration::from_secs(10);
+const BROWSER_FAILURE_BACKOFF_CAPACITY: u64 = 16;
+const BROWSER_FAILURE_BACKOFF_TTL: Duration = Duration::from_secs(30);
 
 static BROWSER_OBSERVATION_CACHE: LazyLock<Cache<String, BrowserPageObservation>> =
     LazyLock::new(|| {
@@ -22,6 +24,13 @@ static BROWSER_OBSERVATION_CACHE: LazyLock<Cache<String, BrowserPageObservation>
             .time_to_live(BROWSER_OBSERVATION_CACHE_TTL)
             .build()
     });
+
+static BROWSER_FAILURE_BACKOFF: LazyLock<Cache<String, String>> = LazyLock::new(|| {
+    Cache::builder()
+        .max_capacity(BROWSER_FAILURE_BACKOFF_CAPACITY)
+        .time_to_live(BROWSER_FAILURE_BACKOFF_TTL)
+        .build()
+});
 
 /// Render a provider page while coalescing duplicate authenticated browser work.
 ///
@@ -33,9 +42,10 @@ static BROWSER_OBSERVATION_CACHE: LazyLock<Cache<String, BrowserPageObservation>
 /// cookie state, so observations are never reused across different authenticated
 /// sessions. Neither cookie values nor the resulting digest are logged.
 ///
-/// Moka's `try_get_with` coalesces concurrent misses for the same key. Failed
-/// renders are not inserted, so a transient Chromium/CDP failure does not poison
-/// subsequent attempts.
+/// Moka's `try_get_with` coalesces concurrent misses for the same key. Successful
+/// observations are cached briefly. A failed render arms a short cookie-scoped
+/// backoff so repeated clicks or background probes do not launch Chromium over
+/// and over on a 1-core/1-GB host. The backoff expires automatically after 30 s.
 pub async fn render_web_page_playback(
     raw_url: &str,
     allowed_domains: &'static [&'static str],
@@ -58,9 +68,24 @@ pub async fn render_web_page_playback(
         return Ok(observation);
     }
 
+    if let Some(previous_error) = BROWSER_FAILURE_BACKOFF.get(&cache_key).await {
+        tracing::warn!(
+            target: "synctv_media_providers::browser_session",
+            stage = "failure_backoff_hit",
+            page_host = %page_host,
+            backoff_ttl_secs = BROWSER_FAILURE_BACKOFF_TTL.as_secs(),
+            previous_error = %previous_error,
+            "Skipping repeated Chromium launch during recent-failure backoff"
+        );
+        return Err(ProviderClientError::Network(format!(
+            "browser discovery is temporarily backed off after a recent failure: {previous_error}"
+        )));
+    }
+
     let raw_url = raw_url.to_string();
     let cookies = cookies.to_vec();
-    BROWSER_OBSERVATION_CACHE
+    let key_for_failure = cache_key.clone();
+    let result = BROWSER_OBSERVATION_CACHE
         .try_get_with(cache_key, async move {
             let started_at = Instant::now();
             tracing::info!(
@@ -69,6 +94,7 @@ pub async fn render_web_page_playback(
                 page_host = %page_host,
                 cache_capacity = BROWSER_OBSERVATION_CACHE_CAPACITY,
                 cache_ttl_secs = BROWSER_OBSERVATION_CACHE_TTL.as_secs(),
+                failure_backoff_secs = BROWSER_FAILURE_BACKOFF_TTL.as_secs(),
                 "Authenticated browser page render diagnostics"
             );
 
@@ -101,8 +127,25 @@ pub async fn render_web_page_playback(
 
             result.map_err(|error| error.to_string())
         })
-        .await
-        .map_err(|error| ProviderClientError::Network(error.as_ref().clone()))
+        .await;
+
+    match result {
+        Ok(observation) => Ok(observation),
+        Err(error) => {
+            let error = error.as_ref().clone();
+            BROWSER_FAILURE_BACKOFF
+                .insert(key_for_failure, error.clone())
+                .await;
+            tracing::warn!(
+                target: "synctv_media_providers::browser_session",
+                stage = "failure_backoff_armed",
+                page_host = %page_host,
+                backoff_ttl_secs = BROWSER_FAILURE_BACKOFF_TTL.as_secs(),
+                "Recent Chromium failure will suppress duplicate launches briefly"
+            );
+            Err(ProviderClientError::Network(error))
+        }
+    }
 }
 
 fn page_host(raw_url: &str) -> String {
