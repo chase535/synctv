@@ -14,6 +14,11 @@ use crate::ProviderClientError;
 
 pub const IQIYI_SESSION_DOMAINS: &[&str] = &["iqiyi.com", "qiyi.com"];
 
+const ABSOLUTE_MEDIA_PATTERN: &str =
+    r#"(?i)(?:https?:)?//[^\s\"'<>\\]+?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?"#;
+const ROOT_RELATIVE_MEDIA_PATTERN: &str =
+    r#"(?i)[\"'](/[^/\s\"'<>\\][^\s\"'<>\\]*?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?)"#;
+
 #[derive(Clone)]
 pub struct IqiyiClient {
     session: ScopedWebSessionClient,
@@ -105,13 +110,10 @@ fn discover_serialized_web_media(
     discovery: &mut WebPagePlaybackDiscovery,
 ) -> Result<(), ProviderClientError> {
     let normalized = normalize_serialized_scan_text(html);
-    let absolute_media_regex =
-        Regex::new(r#"(?i)(?:https?:)?//[^\s\"'<>\\]+?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?"#)
-            .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
-    let root_relative_media_regex = Regex::new(
-        r#"(?i)[\"'](/[^/\s\"'<>\\][^\s\"'<>\\]*?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?)"#,
-    )
-    .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
+    let absolute_media_regex = Regex::new(ABSOLUTE_MEDIA_PATTERN)
+        .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
+    let root_relative_media_regex = Regex::new(ROOT_RELATIVE_MEDIA_PATTERN)
+        .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
     let page_url = Url::parse(&discovery.page_url)
         .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
 
@@ -217,10 +219,59 @@ fn merge_browser_discovery(
     }
 }
 
+fn count_occurrences_with_marker_within(
+    text: &str,
+    needle: &str,
+    marker: &str,
+    radius: usize,
+) -> usize {
+    text.match_indices(needle)
+        .filter(|(index, _)| {
+            let start = index.saturating_sub(radius);
+            let end = index
+                .saturating_add(needle.len())
+                .saturating_add(radius)
+                .min(text.len());
+            let bytes = text.as_bytes();
+            let marker = marker.as_bytes();
+            !marker.is_empty()
+                && end >= start.saturating_add(marker.len())
+                && bytes[start..end]
+                    .windows(marker.len())
+                    .any(|window| window == marker)
+        })
+        .count()
+}
+
+fn minimum_preceding_marker_distance(text: &str, needle: &str, marker: &str) -> Option<usize> {
+    text.match_indices(needle)
+        .filter_map(|(index, _)| {
+            text.get(..index)?
+                .rfind(marker)
+                .map(|marker_index| index.saturating_sub(marker_index))
+        })
+        .min()
+}
+
+fn static_media_candidate_counts(normalized: &str) -> (usize, usize) {
+    let absolute = Regex::new(ABSOLUTE_MEDIA_PATTERN)
+        .map(|regex| regex.find_iter(normalized).count())
+        .unwrap_or_default();
+    let relative = Regex::new(ROOT_RELATIVE_MEDIA_PATTERN)
+        .map(|regex| regex.captures_iter(normalized).count())
+        .unwrap_or_default();
+    (absolute, relative)
+}
+
 fn log_static_diagnostics(page_url: &Url, html: &str, discovery: &WebPagePlaybackDiscovery) {
     let lower = html.to_ascii_lowercase();
     let normalized = normalize_serialized_scan_text(html);
     let normalized_lower = normalized.to_ascii_lowercase();
+    let (absolute_media_candidates, root_relative_media_candidates) =
+        static_media_candidate_counts(&normalized);
+    let m3u8_min_preceding_http_distance =
+        minimum_preceding_marker_distance(&normalized_lower, ".m3u8", "http").unwrap_or_default();
+
     tracing::info!(
         target: "synctv_media_providers::iqiyi",
         stage = "static_html",
@@ -231,6 +282,28 @@ fn log_static_diagnostics(page_url: &Url, html: &str, discovery: &WebPagePlaybac
         has_m3u8 = lower.contains(".m3u8"),
         m3u8_occurrences = lower.match_indices(".m3u8").count(),
         normalized_m3u8_occurrences = normalized_lower.match_indices(".m3u8").count(),
+        normalized_http_occurrences = normalized_lower.match_indices("http").count(),
+        normalized_absolute_media_candidates = absolute_media_candidates,
+        normalized_root_relative_media_candidates = root_relative_media_candidates,
+        normalized_m3u8_http_within_128 = count_occurrences_with_marker_within(
+            &normalized_lower,
+            ".m3u8",
+            "http",
+            128,
+        ),
+        normalized_m3u8_http_within_512 = count_occurrences_with_marker_within(
+            &normalized_lower,
+            ".m3u8",
+            "http",
+            512,
+        ),
+        normalized_m3u8_http_within_2048 = count_occurrences_with_marker_within(
+            &normalized_lower,
+            ".m3u8",
+            "http",
+            2048,
+        ),
+        m3u8_min_preceding_http_distance,
         has_mpd = lower.contains(".mpd"),
         has_mp4 = lower.contains(".mp4"),
         has_video_tag = lower.contains("<video"),
@@ -460,6 +533,17 @@ mod tests {
             r#"const media = "https:\\/\\/cdn.example\\/movie_1080p.m3u8";"#,
         );
         assert!(normalized.contains("https://cdn.example/movie_1080p.m3u8"));
+    }
+
+    #[test]
+    fn static_diagnostics_can_measure_http_proximity_without_exposing_page_text() {
+        let normalized =
+            "prefix https://cdn.example/path/movie.m3u8 suffix .m3u8 unrelated http far";
+        assert_eq!(
+            count_occurrences_with_marker_within(normalized, ".m3u8", "http", 64),
+            1
+        );
+        assert!(minimum_preceding_marker_distance(normalized, ".m3u8", "http").is_some());
     }
 
     #[test]
