@@ -122,11 +122,15 @@ RUN apt-get update && apt-get install -y \
     chromium \
     curl && rm -rf /var/lib/apt/lists/*
 
-# Keep Chromium discovery deterministic inside Docker and reduce glibc arena
-# growth on memory-constrained hosts. Chromium itself is launched with
-# --disable-dev-shm-usage because Docker's default /dev/shm is typically small.
+# Keep Chromium discovery deterministic inside Docker and reduce allocator
+# growth on memory-constrained hosts. Two Tokio workers preserve timer/SQL/
+# WebSocket liveness if one worker is briefly delayed by kernel or filesystem
+# pressure on a single-core VPS; this does not create additional CPU capacity.
+# Chromium itself is launched with --disable-dev-shm-usage because Docker's
+# default /dev/shm is typically small.
 ENV CHROMIUM_BIN=/usr/bin/chromium \
-    MALLOC_ARENA_MAX=2
+    MALLOC_ARENA_MAX=2 \
+    TOKIO_WORKER_THREADS=2
 
 # Create synctv for running the application
 RUN useradd -m -u 1000 synctv
