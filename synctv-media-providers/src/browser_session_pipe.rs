@@ -21,6 +21,7 @@ const CDP_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const CDP_SLOW_COMMAND_THRESHOLD: Duration = Duration::from_millis(500);
 const BROWSER_POST_NAVIGATION_SETTLE_DELAY: Duration = Duration::from_millis(1200);
 const BROWSER_PROBE_INTERVAL: Duration = Duration::from_millis(900);
+// Always leave enough outer-budget headroom to serialize a snapshot and stop Chromium.
 const BROWSER_RENDER_COMPLETION_RESERVE: Duration = Duration::from_millis(1500);
 const BLOB_VIDEO_GRACE_DELAY: Duration = Duration::from_millis(2200);
 const BROWSER_PROFILE_CLEANUP_DELAY: Duration = Duration::from_millis(400);
