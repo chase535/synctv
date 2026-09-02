@@ -122,23 +122,17 @@ RUN apt-get update && apt-get install -y \
     chromium \
     curl && rm -rf /var/lib/apt/lists/*
 
-# Provider pages frequently defer media initialization until autoplay is
-# permitted and a desktop-sized viewport is present. Keep those policy/layout
-# flags in a wrapper so browser_session can continue treating CHROMIUM_BIN as a
-# normal executable while every fallback launch gets the same deterministic
-# playback environment. The provider probe is a foreground-only, single-tab
-# workload, so disable Chromium's background renderer/timer deprioritization: on
-# the constrained host the page is visible but document.hasFocus() is false, and
-# letting Chromium background-throttle that renderer can make CDP evaluation
-# exceed its budget while the player is still bootstrapping. AutomationControlled
-# is also disabled so provider pages see normal browser WebDriver state instead of
-# taking a headless-only initialization path. Authentication is still supplied
-# solely by the user's provider cookie jar.
-RUN printf '%s\n' \
-    '#!/bin/sh' \
-    'exec /usr/bin/chromium --autoplay-policy=no-user-gesture-required --window-size=1280,720 --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-blink-features=AutomationControlled "$@"' \
-    > /usr/local/bin/synctv-chromium && \
-    chmod 0755 /usr/local/bin/synctv-chromium
+# Keep iQiyi bootstrap inspection inside the page process instead of enabling
+# the CDP Network domain. The tiny extension runs only on iqiyi/qiyi pages,
+# inspects at most a handful of provider fetch/XHR response bodies with strict
+# size limits, and publishes only direct HTTP(S) media candidates as inert
+# standalone <source> elements. The existing probe can therefore discover them
+# without shipping response bodies, cookies, or signed query strings over CDP.
+COPY docker/iqiyi-bootstrap /usr/local/share/synctv-iqiyi-bootstrap
+COPY docker/synctv-chromium.sh /usr/local/bin/synctv-chromium
+RUN chmod 0755 /usr/local/bin/synctv-chromium && \
+    chmod 0644 /usr/local/share/synctv-iqiyi-bootstrap/manifest.json \
+        /usr/local/share/synctv-iqiyi-bootstrap/bootstrap.js
 
 # Keep Chromium discovery deterministic inside Docker and reduce allocator
 # growth on memory-constrained hosts. Two Tokio workers preserve timer/SQL/
