@@ -20,13 +20,12 @@ const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
 const CDP_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const CDP_SLOW_COMMAND_THRESHOLD: Duration = Duration::from_millis(500);
 const BROWSER_POST_NAVIGATION_SETTLE_DELAY: Duration = Duration::from_millis(1200);
-const BROWSER_PROBE_INTERVAL: Duration = Duration::from_millis(1200);
-const BROWSER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
-const BROWSER_LOADING_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
+const BROWSER_PROBE_INTERVAL: Duration = Duration::from_millis(900);
+const BROWSER_RENDER_COMPLETION_RESERVE: Duration = Duration::from_millis(1500);
 const BLOB_VIDEO_GRACE_DELAY: Duration = Duration::from_millis(2200);
 const BROWSER_PROFILE_CLEANUP_DELAY: Duration = Duration::from_millis(400);
 const MAX_CONCURRENT_BROWSER_RENDERS: usize = 1;
-const MAX_BROWSER_PROBE_ATTEMPTS: usize = 2;
+const MAX_BROWSER_PROBE_ATTEMPTS: usize = 3;
 const MAX_CDP_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LOGGED_MEDIA_HOSTS: usize = 5;
 const LOW_MEMORY_SINGLE_PROCESS_THRESHOLD_KIB: u64 = 1_200_000;
@@ -329,9 +328,16 @@ pub async fn render_web_page_playback(
     );
 
     let render_started = Instant::now();
+    let render_deadline = render_started + BROWSER_RENDER_TIMEOUT;
     let result = match response_first_timeout(
         BROWSER_RENDER_TIMEOUT,
-        render_web_page_playback_inner(raw_url, allowed_domains, cookies, single_process),
+        render_web_page_playback_inner(
+            raw_url,
+            allowed_domains,
+            cookies,
+            single_process,
+            render_deadline,
+        ),
     )
     .await
     {
@@ -379,6 +385,7 @@ async fn render_web_page_playback_inner(
     allowed_domains: &'static [&'static str],
     cookies: &[SessionCookie],
     single_process: bool,
+    render_deadline: Instant,
 ) -> Result<BrowserPageObservation, ProviderClientError> {
     let page_url = validate_provider_url(raw_url, allowed_domains)?;
     let page_host = page_url.host_str().unwrap_or("").to_string();
@@ -505,6 +512,30 @@ async fn render_web_page_playback_inner(
             transport = "pipe",
             "Authenticated browser page render diagnostics"
         );
+
+        // The headless page reports visibilityState=visible but hasFocus()=false.
+        // Provider player bootstraps can treat that as an inactive tab even when
+        // Chromium background throttling is disabled. Dispatch both focus hints
+        // without waiting for acknowledgements; they share the same CDP pipe and
+        // therefore arrive before Page.navigate, while their late responses are
+        // harmlessly skipped by the first Runtime.evaluate command id.
+        let focus_emulation_command_id = cdp_send_command(
+            &mut pipe,
+            &mut command_id,
+            Some(&session_id),
+            "Emulation.setFocusEmulationEnabled",
+            json!({ "enabled": true }),
+        )
+        .await?;
+        let bring_to_front_command_id = cdp_send_command(
+            &mut pipe,
+            &mut command_id,
+            Some(&session_id),
+            "Page.bringToFront",
+            json!({}),
+        )
+        .await?;
+
         tracing::info!(
             target: "synctv_media_providers::browser_session",
             stage = "cdp_configured",
@@ -517,6 +548,12 @@ async fn render_web_page_playback_inner(
             response_first_deadlines = true,
             state_aware_probe = true,
             final_observation_skipped = true,
+            focus_emulation = true,
+            bring_to_front = true,
+            focus_emulation_command_id,
+            bring_to_front_command_id,
+            max_probe_attempts = MAX_BROWSER_PROBE_ATTEMPTS,
+            render_completion_reserve_ms = BROWSER_RENDER_COMPLETION_RESERVE.as_millis(),
             transport = "pipe",
             flattened_session = true,
             "Authenticated browser page render diagnostics"
@@ -549,6 +586,7 @@ async fn render_web_page_playback_inner(
             &mut command_id,
             &session_id,
             &page_host,
+            render_deadline,
         )
         .await?;
 
@@ -603,6 +641,8 @@ async fn render_web_page_playback_inner(
             play_fulfilled = probe.payload.play_fulfilled,
             play_rejected = probe.payload.play_rejected,
             play_error_name = %probe.payload.play_error_name,
+            document_has_focus = probe.payload.document_has_focus,
+            render_budget_remaining_ms = render_deadline.saturating_duration_since(Instant::now()).as_millis(),
             single_process,
             transport = "pipe",
             "Authenticated browser page render diagnostics"
@@ -890,13 +930,48 @@ async fn wait_for_browser_signal(
     command_id: &mut u64,
     session_id: &str,
     expected_page_host: &str,
+    render_deadline: Instant,
 ) -> Result<BrowserProbeOutcome, ProviderClientError> {
     let started = Instant::now();
     let mut attempts = 0_usize;
     let mut last_successful: Option<BrowserProbePayload> = None;
 
     loop {
+        let remaining = render_deadline.saturating_duration_since(Instant::now());
+        if remaining <= BROWSER_RENDER_COMPLETION_RESERVE {
+            if let Some(payload) = last_successful.take() {
+                tracing::info!(
+                    target: "synctv_media_providers::browser_session",
+                    stage = "page_probe_budget_exhausted",
+                    page_host = %expected_page_host,
+                    successful_attempts = attempts,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    render_budget_remaining_ms = remaining.as_millis(),
+                    reserve_ms = BROWSER_RENDER_COMPLETION_RESERVE.as_millis(),
+                    ready_state = %payload.ready_state,
+                    resource_count = payload.resource_count,
+                    video_element_count = payload.video_element_count,
+                    play_pending = payload.play_pending,
+                    "Returning the last successful browser probe before the outer render deadline"
+                );
+                return Ok(BrowserProbeOutcome {
+                    payload,
+                    reason: "render_budget_exhausted",
+                    attempts,
+                    elapsed: started.elapsed(),
+                });
+            }
+            return Err(ProviderClientError::Network(
+                "browser discovery render budget exhausted before the first page probe completed"
+                    .to_string(),
+            ));
+        }
+
         attempts = attempts.saturating_add(1);
+        let probe_timeout = std::cmp::min(
+            CDP_PROBE_TIMEOUT,
+            remaining.saturating_sub(BROWSER_RENDER_COMPLETION_RESERVE),
+        );
         let evaluation = cdp_call_with_timeout(
             pipe,
             command_id,
@@ -908,7 +983,7 @@ async fn wait_for_browser_signal(
                 "awaitPromise": false,
                 "userGesture": true,
             }),
-            CDP_PROBE_TIMEOUT,
+            probe_timeout,
         )
         .await;
 
@@ -922,9 +997,12 @@ async fn wait_for_browser_signal(
                         page_host = %expected_page_host,
                         attempt = attempts,
                         elapsed_ms = started.elapsed().as_millis(),
+                        probe_timeout_ms = probe_timeout.as_millis(),
+                        render_budget_remaining_ms = render_deadline.saturating_duration_since(Instant::now()).as_millis(),
                         previous_ready_state = %payload.ready_state,
                         previous_resource_count = payload.resource_count,
                         previous_video_element_count = payload.video_element_count,
+                        previous_play_pending = payload.play_pending,
                         error = %error,
                         "Returning the last successful browser probe snapshot instead of failing the whole render"
                     );
@@ -958,6 +1036,8 @@ async fn wait_for_browser_signal(
             current_host = %current_host,
             attempt = attempts,
             max_attempts = MAX_BROWSER_PROBE_ATTEMPTS,
+            probe_timeout_ms = probe_timeout.as_millis(),
+            render_budget_remaining_ms = render_deadline.saturating_duration_since(Instant::now()).as_millis(),
             elapsed_ms = started.elapsed().as_millis(),
             ready_state = %payload.ready_state,
             resource_count = payload.resource_count,
@@ -999,7 +1079,6 @@ async fn wait_for_browser_signal(
 
         let elapsed = started.elapsed();
         let navigation_committed = !current_host.is_empty();
-        let document_loading = payload.ready_state == "loading";
         let reason = if !payload.media_urls.is_empty() {
             Some("media_url")
         } else if payload.has_license_resource {
@@ -1008,16 +1087,9 @@ async fn wait_for_browser_signal(
             Some("blob_video")
         } else if payload.ready_state == "complete" {
             Some("document_complete")
-        } else if !document_loading && elapsed >= BROWSER_DISCOVERY_TIMEOUT {
-            Some("probe_timeout_ready")
-        } else if document_loading
-            && elapsed >= BROWSER_LOADING_DISCOVERY_TIMEOUT
-            && attempts >= MAX_BROWSER_PROBE_ATTEMPTS
-        {
-            Some("probe_timeout_loading")
-        } else if navigation_committed && attempts >= MAX_BROWSER_PROBE_ATTEMPTS {
+        } else if attempts >= MAX_BROWSER_PROBE_ATTEMPTS && navigation_committed {
             Some("probe_attempt_limit")
-        } else if !navigation_committed && attempts >= MAX_BROWSER_PROBE_ATTEMPTS {
+        } else if attempts >= MAX_BROWSER_PROBE_ATTEMPTS {
             Some("navigation_not_committed")
         } else {
             None
@@ -1033,6 +1105,10 @@ async fn wait_for_browser_signal(
         }
 
         last_successful = Some(payload);
+        let remaining = render_deadline.saturating_duration_since(Instant::now());
+        if remaining <= BROWSER_RENDER_COMPLETION_RESERVE + BROWSER_PROBE_INTERVAL {
+            continue;
+        }
         tokio::time::sleep(BROWSER_PROBE_INTERVAL).await;
     }
 }
