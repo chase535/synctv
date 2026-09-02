@@ -17,12 +17,16 @@ const BROWSER_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
 const BROWSER_RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 const CDP_STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
+const CDP_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const CDP_SLOW_COMMAND_THRESHOLD: Duration = Duration::from_millis(500);
-const BROWSER_PROBE_INTERVAL: Duration = Duration::from_millis(400);
-const BROWSER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const BROWSER_POST_NAVIGATION_SETTLE_DELAY: Duration = Duration::from_millis(1200);
+const BROWSER_PROBE_INTERVAL: Duration = Duration::from_millis(1200);
+const BROWSER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
+const BROWSER_LOADING_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
 const BLOB_VIDEO_GRACE_DELAY: Duration = Duration::from_millis(2200);
 const BROWSER_PROFILE_CLEANUP_DELAY: Duration = Duration::from_millis(400);
 const MAX_CONCURRENT_BROWSER_RENDERS: usize = 1;
+const MAX_BROWSER_PROBE_ATTEMPTS: usize = 2;
 const MAX_CDP_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LOGGED_MEDIA_HOSTS: usize = 5;
 const LOW_MEMORY_SINGLE_PROCESS_THRESHOLD_KIB: u64 = 1_200_000;
@@ -54,24 +58,17 @@ pub struct BrowserPageObservation {
     pub diagnostics: BrowserPageDiagnostics,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BrowserObservationPayload {
-    current_url: String,
-    title: String,
-    media_urls: Vec<String>,
-    drm_detected: bool,
-    diagnostics: BrowserPageDiagnostics,
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BrowserProbePayload {
+    current_url: String,
+    title: String,
     ready_state: String,
     resource_count: usize,
     xhr_fetch_count: usize,
     segment_like_count: usize,
     video_element_count: usize,
+    source_element_count: usize,
     video_with_current_src_count: usize,
     video_with_src_attr_count: usize,
     video_paused_count: usize,
@@ -187,7 +184,7 @@ fn schedule_profile_cleanup(profile_dir: PathBuf, page_host: String) {
         return;
     };
 
-    runtime.spawn(async move {
+    let _cleanup_task = runtime.spawn(async move {
         let delays = [
             BROWSER_PROFILE_CLEANUP_DELAY,
             Duration::from_millis(800),
@@ -518,17 +515,13 @@ async fn render_web_page_playback_inner(
             interactive_probe = true,
             navigation_ack_waited = false,
             response_first_deadlines = true,
+            state_aware_probe = true,
+            final_observation_skipped = true,
             transport = "pipe",
             flattened_session = true,
             "Authenticated browser page render diagnostics"
         );
 
-        // Page.navigate only needs to be dispatched. Waiting for its acknowledgement
-        // creates a false-failure window on the 1-core host: the latest deployment
-        // configured a 6 s command timeout but Tokio was not scheduled again until
-        // 12.5 s later while unrelated SQL operations were also delayed by 7-8 s.
-        // Subsequent Runtime.evaluate probes naturally serialize behind navigation;
-        // any late Page.navigate acknowledgement is harmlessly skipped by command id.
         let navigate_started = Instant::now();
         let navigation_command_id = cdp_send_command(
             &mut pipe,
@@ -544,11 +537,13 @@ async fn render_web_page_playback_inner(
             page_host = %page_host,
             navigation_command_id,
             ack_waited = false,
+            settle_delay_ms = BROWSER_POST_NAVIGATION_SETTLE_DELAY.as_millis(),
             elapsed_ms = navigate_started.elapsed().as_millis(),
             render_elapsed_ms = startup_started.elapsed().as_millis(),
             "Authenticated browser page render diagnostics"
         );
 
+        tokio::time::sleep(BROWSER_POST_NAVIGATION_SETTLE_DELAY).await;
         let probe = wait_for_browser_signal(
             &mut pipe,
             &mut command_id,
@@ -557,49 +552,52 @@ async fn render_web_page_playback_inner(
         )
         .await?;
 
-        let observation_started = Instant::now();
-        let evaluation = cdp_call(
-            &mut pipe,
-            &mut command_id,
-            Some(&session_id),
-            "Runtime.evaluate",
-            json!({
-                "expression": browser_observation_script(),
-                "returnByValue": true,
-                "awaitPromise": false,
-            }),
-        )
-        .await?;
-        let serialized = evaluation
-            .pointer("/result/value")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ProviderClientError::Parse(
-                    "browser observation did not return a serialized value".to_string(),
-                )
-            })?;
-        let mut payload: BrowserObservationPayload = serde_json::from_str(serialized)
-            .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
-        payload.media_urls.extend(probe.payload.media_urls);
-        let final_url = validate_provider_url(&payload.current_url, allowed_domains)?;
-        let media_urls = normalize_media_urls(&final_url, payload.media_urls);
+        let final_url = match validate_provider_url(&probe.payload.current_url, allowed_domains) {
+            Ok(url) => url,
+            Err(_) if probe.payload.current_url.is_empty() || probe.payload.current_url == "about:blank" => {
+                page_url.clone()
+            }
+            Err(error) => return Err(error),
+        };
+        let media_urls = normalize_media_urls(&final_url, probe.payload.media_urls.clone());
+        let has_m3u8 = media_urls.iter().any(|url| url.to_ascii_lowercase().contains(".m3u8"));
+        let has_mpd = media_urls.iter().any(|url| url.to_ascii_lowercase().contains(".mpd"));
+        let has_mp4 = media_urls.iter().any(|url| url.to_ascii_lowercase().contains(".mp4"));
+        let diagnostics = BrowserPageDiagnostics {
+            ready_state: probe.payload.ready_state.clone(),
+            html_length: 0,
+            resource_count: probe.payload.resource_count,
+            media_resource_count: probe.payload.media_urls.len(),
+            video_element_count: probe.payload.video_element_count,
+            source_element_count: probe.payload.source_element_count,
+            has_m3u8,
+            has_mpd,
+            has_mp4,
+            has_blob_video: probe.payload.has_blob_video,
+            has_video_id: false,
+            has_tv_id: false,
+            has_drm_marker: false,
+            has_license_resource: probe.payload.has_license_resource,
+        };
+        let drm_detected = probe.payload.has_license_resource;
 
         tracing::info!(
             target: "synctv_media_providers::browser_session",
             stage = "observation_complete",
             page_host = %page_host,
+            observation_source = "probe_snapshot",
+            final_observation_skipped = true,
             probe_reason = probe.reason,
             probe_attempts = probe.attempts,
             probe_elapsed_ms = probe.elapsed.as_millis(),
-            observation_elapsed_ms = observation_started.elapsed().as_millis(),
-            ready_state = %payload.diagnostics.ready_state,
-            resource_count = payload.diagnostics.resource_count,
-            media_resource_count = payload.diagnostics.media_resource_count,
+            ready_state = %diagnostics.ready_state,
+            resource_count = diagnostics.resource_count,
+            media_resource_count = diagnostics.media_resource_count,
             media_count = media_urls.len(),
             media_hosts = %summarize_media_hosts(&media_urls),
             media_kinds = %summarize_media_kinds(&media_urls),
-            has_blob_video = payload.diagnostics.has_blob_video,
-            drm_detected = payload.drm_detected,
+            has_blob_video = diagnostics.has_blob_video,
+            drm_detected,
             play_attempted = probe.payload.play_attempted,
             play_pending = probe.payload.play_pending,
             play_fulfilled = probe.payload.play_fulfilled,
@@ -613,11 +611,12 @@ async fn render_web_page_playback_inner(
         Ok(BrowserPageObservation {
             discovery: WebPagePlaybackDiscovery {
                 page_url: final_url.to_string(),
-                title: (!payload.title.trim().is_empty()).then(|| payload.title.trim().to_string()),
+                title: (!probe.payload.title.trim().is_empty())
+                    .then(|| probe.payload.title.trim().to_string()),
                 media_urls,
-                drm_detected: payload.drm_detected,
+                drm_detected,
             },
-            diagnostics: payload.diagnostics,
+            diagnostics,
         })
     }
     .await;
@@ -894,10 +893,11 @@ async fn wait_for_browser_signal(
 ) -> Result<BrowserProbeOutcome, ProviderClientError> {
     let started = Instant::now();
     let mut attempts = 0_usize;
+    let mut last_successful: Option<BrowserProbePayload> = None;
 
     loop {
         attempts = attempts.saturating_add(1);
-        let evaluation = cdp_call(
+        let evaluation = cdp_call_with_timeout(
             pipe,
             command_id,
             Some(session_id),
@@ -908,8 +908,37 @@ async fn wait_for_browser_signal(
                 "awaitPromise": false,
                 "userGesture": true,
             }),
+            CDP_PROBE_TIMEOUT,
         )
-        .await?;
+        .await;
+
+        let evaluation = match evaluation {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(payload) = last_successful.take() {
+                    tracing::warn!(
+                        target: "synctv_media_providers::browser_session",
+                        stage = "page_probe_retry_failed",
+                        page_host = %page_host,
+                        attempt = attempts,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        previous_ready_state = %payload.ready_state,
+                        previous_resource_count = payload.resource_count,
+                        previous_video_element_count = payload.video_element_count,
+                        error = %error,
+                        "Returning the last successful browser probe snapshot instead of failing the whole render"
+                    );
+                    return Ok(BrowserProbeOutcome {
+                        payload,
+                        reason: "probe_retry_failed",
+                        attempts: attempts.saturating_sub(1),
+                        elapsed: started.elapsed(),
+                    });
+                }
+                return Err(error);
+            }
+        };
+
         let serialized = evaluation
             .pointer("/result/value")
             .and_then(Value::as_str)
@@ -920,18 +949,22 @@ async fn wait_for_browser_signal(
             })?;
         let payload: BrowserProbePayload = serde_json::from_str(serialized)
             .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
+        let current_host = page_host(&payload.current_url);
 
         tracing::info!(
             target: "synctv_media_providers::browser_session",
             stage = "page_probe",
             page_host = %page_host,
+            current_host = %current_host,
             attempt = attempts,
+            max_attempts = MAX_BROWSER_PROBE_ATTEMPTS,
             elapsed_ms = started.elapsed().as_millis(),
             ready_state = %payload.ready_state,
             resource_count = payload.resource_count,
             xhr_fetch_count = payload.xhr_fetch_count,
             segment_like_count = payload.segment_like_count,
             video_element_count = payload.video_element_count,
+            source_element_count = payload.source_element_count,
             video_with_current_src_count = payload.video_with_current_src_count,
             video_with_src_attr_count = payload.video_with_src_attr_count,
             video_paused_count = payload.video_paused_count,
@@ -965,14 +998,27 @@ async fn wait_for_browser_signal(
         );
 
         let elapsed = started.elapsed();
+        let navigation_committed = !current_host.is_empty();
+        let document_loading = payload.ready_state == "loading";
         let reason = if !payload.media_urls.is_empty() {
             Some("media_url")
         } else if payload.has_license_resource {
             Some("license_resource")
         } else if payload.has_blob_video && elapsed >= BLOB_VIDEO_GRACE_DELAY {
             Some("blob_video")
-        } else if elapsed >= BROWSER_DISCOVERY_TIMEOUT {
-            Some("probe_timeout")
+        } else if payload.ready_state == "complete" {
+            Some("document_complete")
+        } else if !document_loading && elapsed >= BROWSER_DISCOVERY_TIMEOUT {
+            Some("probe_timeout_ready")
+        } else if document_loading
+            && elapsed >= BROWSER_LOADING_DISCOVERY_TIMEOUT
+            && attempts >= MAX_BROWSER_PROBE_ATTEMPTS
+        {
+            Some("probe_timeout_loading")
+        } else if navigation_committed && attempts >= MAX_BROWSER_PROBE_ATTEMPTS {
+            Some("probe_attempt_limit")
+        } else if !navigation_committed && attempts >= MAX_BROWSER_PROBE_ATTEMPTS {
+            Some("navigation_not_committed")
         } else {
             None
         };
@@ -985,6 +1031,8 @@ async fn wait_for_browser_signal(
                 elapsed,
             });
         }
+
+        last_successful = Some(payload);
         tokio::time::sleep(BROWSER_PROBE_INTERVAL).await;
     }
 }
@@ -1364,11 +1412,14 @@ fn browser_probe_script() -> &'static str {
         const codecVideo = document.createElement('video');
         const hasMediaSource = typeof MediaSource !== 'undefined';
         return JSON.stringify({
+            currentUrl: location.href || '',
+            title: document.title || '',
             readyState: document.readyState || '',
             resourceCount: resources.length,
             xhrFetchCount: resources.filter((entry) => entry.initiator === 'fetch' || entry.initiator === 'xmlhttprequest').length,
             segmentLikeCount: resources.filter((entry) => segmentPattern.test(entry.name)).length,
             videoElementCount: videos.length,
+            sourceElementCount: sources.length,
             videoWithCurrentSrcCount: videos.filter((video) => !!video.currentSrc).length,
             videoWithSrcAttrCount: videos.filter((video) => !!(video.getAttribute('src') || video.src)).length,
             videoPausedCount: videos.filter((video) => video.paused).length,
@@ -1393,61 +1444,6 @@ fn browser_probe_script() -> &'static str {
             videoH264CanPlay: !!codecVideo.canPlayType(h264),
             navigatorWebdriver: navigator.webdriver === true,
             emeAvailable: typeof navigator.requestMediaKeySystemAccess === 'function'
-        });
-    })()"#
-}
-
-fn browser_observation_script() -> &'static str {
-    r#"(() => {
-        const entries = performance.getEntriesByType('resource');
-        const mediaPattern = /\.(?:m3u8|mpd|mp4)(?:[?#]|$)/i;
-        const mediaInitiators = new Set(['video', 'audio', 'media']);
-        const resources = entries.map((entry) => ({
-            name: entry.name || '',
-            initiator: entry.initiatorType || 'other'
-        }));
-        const mediaUrls = resources
-            .filter((entry) => mediaPattern.test(entry.name) || mediaInitiators.has(entry.initiator))
-            .map((entry) => entry.name);
-        const videos = Array.from(document.querySelectorAll('video'));
-        const sources = Array.from(document.querySelectorAll('source'));
-        for (const element of [...videos, ...sources]) {
-            const value = element.currentSrc || element.src || element.getAttribute('src') || '';
-            if (value && !value.startsWith('blob:') && !value.startsWith('data:')) mediaUrls.push(value);
-        }
-        const scriptText = Array.from(document.scripts)
-            .map((script) => script.textContent || '')
-            .join('\n')
-            .toLowerCase();
-        const bodyText = (document.body && document.body.innerText ? document.body.innerText : '').toLowerCase();
-        const markerText = `${scriptText}\n${bodyText}`;
-        const hasDrmMarker = ['widevine','playready','fairplay','com.widevine.alpha','licenseurl','license_url','drmlicense']
-            .some((marker) => markerText.includes(marker));
-        const hasLicenseResource = resources.some((entry) => /(widevine|playready|drm|license)/i.test(entry.name));
-        const htmlLength = document.documentElement && document.documentElement.innerHTML
-            ? document.documentElement.innerHTML.length
-            : 0;
-        return JSON.stringify({
-            currentUrl: location.href,
-            title: document.title || '',
-            mediaUrls: Array.from(new Set(mediaUrls)),
-            drmDetected: hasDrmMarker || hasLicenseResource,
-            diagnostics: {
-                readyState: document.readyState || '',
-                htmlLength,
-                resourceCount: resources.length,
-                mediaResourceCount: resources.filter((entry) => mediaPattern.test(entry.name) || mediaInitiators.has(entry.initiator)).length,
-                videoElementCount: videos.length,
-                sourceElementCount: sources.length,
-                hasM3u8: markerText.includes('.m3u8') || resources.some((entry) => /\.m3u8(?:[?#]|$)/i.test(entry.name)),
-                hasMpd: markerText.includes('.mpd') || resources.some((entry) => /\.mpd(?:[?#]|$)/i.test(entry.name)),
-                hasMp4: markerText.includes('.mp4') || resources.some((entry) => /\.mp4(?:[?#]|$)/i.test(entry.name)),
-                hasBlobVideo: videos.some((video) => (video.currentSrc || video.src || '').startsWith('blob:')),
-                hasVideoId: /(?:videoid|video_id|vid)[\"'\s:=]/i.test(markerText),
-                hasTvId: /(?:tvid|tv_id)[\"'\s:=]/i.test(markerText),
-                hasDrmMarker,
-                hasLicenseResource
-            }
         });
     })()"#
 }
