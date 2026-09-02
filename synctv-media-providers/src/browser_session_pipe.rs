@@ -17,10 +17,12 @@ const BROWSER_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
 const BROWSER_RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 const CDP_STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
-const CDP_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+const CDP_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CDP_SLOW_COMMAND_THRESHOLD: Duration = Duration::from_millis(500);
 const BROWSER_POST_NAVIGATION_SETTLE_DELAY: Duration = Duration::from_millis(1200);
 const BROWSER_PROBE_INTERVAL: Duration = Duration::from_millis(900);
+const BROWSER_FAILED_PROBE_RETRY_DELAY: Duration = Duration::from_millis(300);
+const BROWSER_MIN_PROBE_EXECUTION_BUDGET: Duration = Duration::from_secs(3);
 // Always leave enough outer-budget headroom to serialize a snapshot and stop Chromium.
 const BROWSER_RENDER_COMPLETION_RESERVE: Duration = Duration::from_millis(1500);
 const BLOB_VIDEO_GRACE_DELAY: Duration = Duration::from_millis(2200);
@@ -554,6 +556,10 @@ async fn render_web_page_playback_inner(
             focus_emulation_command_id,
             bring_to_front_command_id,
             max_probe_attempts = MAX_BROWSER_PROBE_ATTEMPTS,
+            probe_timeout_ms = CDP_PROBE_TIMEOUT.as_millis(),
+            initial_probe_timeout_retry = true,
+            failed_probe_retry_delay_ms = BROWSER_FAILED_PROBE_RETRY_DELAY.as_millis(),
+            min_probe_execution_budget_ms = BROWSER_MIN_PROBE_EXECUTION_BUDGET.as_millis(),
             render_completion_reserve_ms = BROWSER_RENDER_COMPLETION_RESERVE.as_millis(),
             transport = "pipe",
             flattened_session = true,
@@ -941,16 +947,19 @@ async fn wait_for_browser_signal(
 
     loop {
         let remaining = render_deadline.saturating_duration_since(Instant::now());
-        if remaining <= BROWSER_RENDER_COMPLETION_RESERVE {
+        let minimum_probe_budget =
+            BROWSER_RENDER_COMPLETION_RESERVE + BROWSER_MIN_PROBE_EXECUTION_BUDGET;
+        if remaining <= minimum_probe_budget {
             if let Some(payload) = last_successful.take() {
                 tracing::info!(
                     target: "synctv_media_providers::browser_session",
                     stage = "page_probe_budget_exhausted",
                     page_host = %expected_page_host,
-                    successful_attempts = attempts,
+                    attempted_probes = attempts,
                     elapsed_ms = started.elapsed().as_millis(),
                     render_budget_remaining_ms = remaining.as_millis(),
                     reserve_ms = BROWSER_RENDER_COMPLETION_RESERVE.as_millis(),
+                    min_probe_execution_budget_ms = BROWSER_MIN_PROBE_EXECUTION_BUDGET.as_millis(),
                     ready_state = %payload.ready_state,
                     resource_count = payload.resource_count,
                     video_element_count = payload.video_element_count,
@@ -965,7 +974,7 @@ async fn wait_for_browser_signal(
                 });
             }
             return Err(ProviderClientError::Network(
-                "browser discovery render budget exhausted before the first page probe completed"
+                "browser discovery render budget exhausted before a useful first page probe could complete"
                     .to_string(),
             ));
         }
@@ -1018,6 +1027,39 @@ async fn wait_for_browser_signal(
                         elapsed: started.elapsed(),
                     });
                 }
+
+                let remaining_after_error =
+                    render_deadline.saturating_duration_since(Instant::now());
+                let retry_budget = BROWSER_RENDER_COMPLETION_RESERVE
+                    + BROWSER_MIN_PROBE_EXECUTION_BUDGET
+                    + BROWSER_FAILED_PROBE_RETRY_DELAY;
+                let retryable_timeout = matches!(
+                    &error,
+                    ProviderClientError::Network(message)
+                        if message.contains("Chromium CDP command Runtime.evaluate timed out")
+                );
+                if retryable_timeout
+                    && attempts < MAX_BROWSER_PROBE_ATTEMPTS
+                    && remaining_after_error > retry_budget
+                {
+                    tracing::warn!(
+                        target: "synctv_media_providers::browser_session",
+                        stage = "page_probe_initial_timeout_retrying",
+                        page_host = %expected_page_host,
+                        attempt = attempts,
+                        next_attempt = attempts + 1,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        probe_timeout_ms = probe_timeout.as_millis(),
+                        render_budget_remaining_ms = remaining_after_error.as_millis(),
+                        retry_delay_ms = BROWSER_FAILED_PROBE_RETRY_DELAY.as_millis(),
+                        min_probe_execution_budget_ms = BROWSER_MIN_PROBE_EXECUTION_BUDGET.as_millis(),
+                        error = %error,
+                        "First browser probe timed out while the renderer was busy; retrying within the existing render deadline instead of restarting Chromium"
+                    );
+                    tokio::time::sleep(BROWSER_FAILED_PROBE_RETRY_DELAY).await;
+                    continue;
+                }
+
                 return Err(error);
             }
         };
@@ -1114,7 +1156,7 @@ async fn wait_for_browser_signal(
         last_successful = Some(payload);
         let remaining = render_deadline.saturating_duration_since(Instant::now());
         let minimum_next_probe_budget =
-            BROWSER_RENDER_COMPLETION_RESERVE + Duration::from_millis(250);
+            BROWSER_RENDER_COMPLETION_RESERVE + BROWSER_MIN_PROBE_EXECUTION_BUDGET;
         if remaining > minimum_next_probe_budget {
             let sleep_budget = remaining.saturating_sub(minimum_next_probe_budget);
             tokio::time::sleep(std::cmp::min(BROWSER_PROBE_INTERVAL, sleep_budget)).await;
@@ -1603,6 +1645,8 @@ mod tests {
     fn adaptive_probe_budget_keeps_shutdown_reserve() {
         assert!(MAX_BROWSER_PROBE_ATTEMPTS >= 3);
         assert!(BROWSER_RENDER_COMPLETION_RESERVE >= Duration::from_millis(1000));
+        assert!(BROWSER_MIN_PROBE_EXECUTION_BUDGET >= Duration::from_secs(2));
+        assert!(BROWSER_FAILED_PROBE_RETRY_DELAY < BROWSER_MIN_PROBE_EXECUTION_BUDGET);
         assert!(CDP_PROBE_TIMEOUT < BROWSER_RENDER_TIMEOUT);
     }
 }
