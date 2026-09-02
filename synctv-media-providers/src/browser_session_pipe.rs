@@ -14,7 +14,7 @@ use crate::web_session::{SessionCookie, WebPagePlaybackDiscovery};
 use crate::{ProviderClientError, PROVIDER_DESKTOP_WEB_USER_AGENT};
 
 const BROWSER_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
-const BROWSER_RENDER_TIMEOUT: Duration = Duration::from_secs(30);
+const BROWSER_RENDER_TIMEOUT: Duration = Duration::from_secs(27);
 const CDP_STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
 const CDP_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -28,7 +28,7 @@ const BROWSER_RENDER_COMPLETION_RESERVE: Duration = Duration::from_millis(1500);
 const BLOB_VIDEO_GRACE_DELAY: Duration = Duration::from_millis(2200);
 const BROWSER_PROFILE_CLEANUP_DELAY: Duration = Duration::from_millis(400);
 const MAX_CONCURRENT_BROWSER_RENDERS: usize = 1;
-const MAX_BROWSER_PROBE_ATTEMPTS: usize = 3;
+const MAX_BROWSER_PROBE_ATTEMPTS: usize = 4;
 const MAX_CDP_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LOGGED_MEDIA_HOSTS: usize = 5;
 const LOW_MEMORY_SINGLE_PROCESS_THRESHOLD_KIB: u64 = 1_200_000;
