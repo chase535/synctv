@@ -642,7 +642,9 @@ async fn render_web_page_playback_inner(
             play_rejected = probe.payload.play_rejected,
             play_error_name = %probe.payload.play_error_name,
             document_has_focus = probe.payload.document_has_focus,
-            render_budget_remaining_ms = render_deadline.saturating_duration_since(Instant::now()).as_millis(),
+            render_budget_remaining_ms = render_deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis(),
             single_process,
             transport = "pipe",
             "Authenticated browser page render diagnostics"
@@ -998,7 +1000,9 @@ async fn wait_for_browser_signal(
                         attempt = attempts,
                         elapsed_ms = started.elapsed().as_millis(),
                         probe_timeout_ms = probe_timeout.as_millis(),
-                        render_budget_remaining_ms = render_deadline.saturating_duration_since(Instant::now()).as_millis(),
+                        render_budget_remaining_ms = render_deadline
+                            .saturating_duration_since(Instant::now())
+                            .as_millis(),
                         previous_ready_state = %payload.ready_state,
                         previous_resource_count = payload.resource_count,
                         previous_video_element_count = payload.video_element_count,
@@ -1037,7 +1041,9 @@ async fn wait_for_browser_signal(
             attempt = attempts,
             max_attempts = MAX_BROWSER_PROBE_ATTEMPTS,
             probe_timeout_ms = probe_timeout.as_millis(),
-            render_budget_remaining_ms = render_deadline.saturating_duration_since(Instant::now()).as_millis(),
+            render_budget_remaining_ms = render_deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis(),
             elapsed_ms = started.elapsed().as_millis(),
             ready_state = %payload.ready_state,
             resource_count = payload.resource_count,
