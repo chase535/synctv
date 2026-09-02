@@ -1112,10 +1112,13 @@ async fn wait_for_browser_signal(
 
         last_successful = Some(payload);
         let remaining = render_deadline.saturating_duration_since(Instant::now());
-        if remaining <= BROWSER_RENDER_COMPLETION_RESERVE + BROWSER_PROBE_INTERVAL {
+        let minimum_next_probe_budget =
+            BROWSER_RENDER_COMPLETION_RESERVE + Duration::from_millis(250);
+        if remaining <= minimum_next_probe_budget {
             continue;
         }
-        tokio::time::sleep(BROWSER_PROBE_INTERVAL).await;
+        let sleep_budget = remaining.saturating_sub(minimum_next_probe_budget);
+        tokio::time::sleep(std::cmp::min(BROWSER_PROBE_INTERVAL, sleep_budget)).await;
     }
 }
 
