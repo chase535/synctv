@@ -14,12 +14,13 @@ use crate::web_session::{SessionCookie, WebPagePlaybackDiscovery};
 use crate::{ProviderClientError, PROVIDER_DESKTOP_WEB_USER_AGENT};
 
 const BROWSER_QUEUE_TIMEOUT: Duration = Duration::from_secs(8);
-const BROWSER_RENDER_TIMEOUT: Duration = Duration::from_secs(22);
-const CDP_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const BROWSER_RENDER_TIMEOUT: Duration = Duration::from_secs(27);
+const BROWSER_ACTIVE_CAPTURE_TIMEOUT: Duration = Duration::from_secs(17);
+const CDP_STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
-const CDP_POLL_TIMEOUT: Duration = Duration::from_millis(2500);
-const BOOTSTRAP_SETTLE_DELAY: Duration = Duration::from_millis(700);
-const BOOTSTRAP_POLL_INTERVAL: Duration = Duration::from_millis(650);
+const CDP_POLL_TIMEOUT: Duration = Duration::from_millis(1200);
+const BOOTSTRAP_SETTLE_DELAY: Duration = Duration::from_millis(450);
+const BOOTSTRAP_POLL_INTERVAL: Duration = Duration::from_millis(400);
 const BROWSER_PROFILE_CLEANUP_DELAY: Duration = Duration::from_millis(300);
 const BROWSER_RENDER_COMPLETION_RESERVE: Duration = Duration::from_millis(1200);
 const MAX_CONCURRENT_BROWSER_RENDERS: usize = 1;
@@ -59,16 +60,12 @@ struct BootstrapSnapshot {
     current_url: String,
     title: String,
     ready_state: String,
-    resource_count: usize,
-    video_element_count: usize,
-    source_element_count: usize,
     candidate_urls: Vec<String>,
     xhr_count: usize,
     fetch_count: usize,
     scanned_response_count: usize,
     truncated_response_count: usize,
     inline_manifest_count: usize,
-    has_blob_video: bool,
     has_license_resource: bool,
 }
 
@@ -236,6 +233,7 @@ pub async fn render_web_page_playback(
         stage = "bootstrap_render_requested",
         page_host = %page_host,
         render_timeout_ms = BROWSER_RENDER_TIMEOUT.as_millis(),
+        active_capture_timeout_ms = BROWSER_ACTIVE_CAPTURE_TIMEOUT.as_millis(),
         max_concurrent_renders = MAX_CONCURRENT_BROWSER_RENDERS,
         single_process,
         strategy = "xhr_bootstrap_hook",
@@ -305,7 +303,10 @@ async fn render_bootstrap_inner(
     };
 
     let result = async {
+        let startup_started = Instant::now();
         let mut command_id = 0_u64;
+
+        let stage_started = Instant::now();
         let targets = cdp_call(
             &mut pipe,
             &mut command_id,
@@ -315,11 +316,13 @@ async fn render_bootstrap_inner(
             CDP_STARTUP_TIMEOUT,
         )
         .await?;
+        let target_wait_ms = stage_started.elapsed().as_millis();
         let target_id = first_page_target_id(&targets).ok_or_else(|| {
             ProviderClientError::Parse("Chromium returned no page target".to_string())
         })?;
 
         let (cookie_params, cookie_stats) = prepare_chromium_cookies(cookies);
+        let stage_started = Instant::now();
         if !cookie_params.is_empty() {
             cdp_call(
                 &mut pipe,
@@ -331,7 +334,9 @@ async fn render_bootstrap_inner(
             )
             .await?;
         }
+        let cookie_install_ms = stage_started.elapsed().as_millis();
 
+        let stage_started = Instant::now();
         let attached = cdp_call(
             &mut pipe,
             &mut command_id,
@@ -341,6 +346,7 @@ async fn render_bootstrap_inner(
             CDP_COMMAND_TIMEOUT,
         )
         .await?;
+        let attach_ms = stage_started.elapsed().as_millis();
         let session_id = attached
             .get("sessionId")
             .and_then(Value::as_str)
@@ -351,6 +357,7 @@ async fn render_bootstrap_inner(
             })?
             .to_string();
 
+        let stage_started = Instant::now();
         cdp_call(
             &mut pipe,
             &mut command_id,
@@ -360,6 +367,8 @@ async fn render_bootstrap_inner(
             CDP_COMMAND_TIMEOUT,
         )
         .await?;
+        let hook_install_ms = stage_started.elapsed().as_millis();
+        let startup_elapsed_ms = startup_started.elapsed().as_millis();
 
         tracing::info!(
             target: "synctv_media_providers::browser_session",
@@ -369,6 +378,11 @@ async fn render_bootstrap_inner(
             cookie_count = cookie_stats.effective_count,
             cookie_expired_dropped = cookie_stats.expired_dropped,
             cookie_duplicate_dropped = cookie_stats.duplicate_dropped,
+            target_wait_ms,
+            cookie_install_ms,
+            attach_ms,
+            hook_install_ms,
+            startup_elapsed_ms,
             body_scan_limit_bytes = 262_144,
             fetch_body_scan_limit_bytes = 65_536,
             chromium_events_enabled = false,
@@ -386,6 +400,22 @@ async fn render_bootstrap_inner(
             json!({ "url": page_url.as_str() }),
         )
         .await?;
+        let navigation_started = Instant::now();
+        let active_deadline = std::cmp::min(
+            deadline,
+            navigation_started + BROWSER_ACTIVE_CAPTURE_TIMEOUT,
+        );
+        tracing::info!(
+            target: "synctv_media_providers::browser_session",
+            stage = "bootstrap_navigation_started",
+            page_host = %page_host,
+            startup_elapsed_ms,
+            active_budget_ms = active_deadline
+                .saturating_duration_since(navigation_started)
+                .as_millis(),
+            hard_remaining_ms = deadline.saturating_duration_since(navigation_started).as_millis(),
+            "Official provider page navigation started with a separate active-capture budget"
+        );
         tokio::time::sleep(BOOTSTRAP_SETTLE_DELAY).await;
 
         let snapshot = poll_bootstrap(
@@ -393,7 +423,7 @@ async fn render_bootstrap_inner(
             &mut command_id,
             &session_id,
             &page_host,
-            deadline,
+            active_deadline,
         )
         .await?;
 
@@ -423,17 +453,18 @@ async fn render_bootstrap_inner(
         let has_m3u8 = lower_urls.iter().any(|value| value.contains(".m3u8"));
         let has_mpd = lower_urls.iter().any(|value| value.contains(".mpd"));
         let has_mp4 = lower_urls.iter().any(|value| value.contains(".mp4"));
+        let provider_request_count = snapshot.xhr_count.saturating_add(snapshot.fetch_count);
         let diagnostics = BrowserPageDiagnostics {
             ready_state: snapshot.ready_state.clone(),
             html_length: 0,
-            resource_count: snapshot.resource_count,
+            resource_count: provider_request_count,
             media_resource_count: media_urls.len(),
-            video_element_count: snapshot.video_element_count,
-            source_element_count: snapshot.source_element_count,
+            video_element_count: 0,
+            source_element_count: 0,
             has_m3u8,
             has_mpd,
             has_mp4,
-            has_blob_video: snapshot.has_blob_video,
+            has_blob_video: false,
             has_video_id: false,
             has_tv_id: false,
             has_drm_marker: snapshot.has_license_resource,
@@ -445,16 +476,18 @@ async fn render_bootstrap_inner(
             stage = "bootstrap_observation_complete",
             page_host = %page_host,
             ready_state = %snapshot.ready_state,
-            resource_count = snapshot.resource_count,
+            provider_request_count,
             xhr_count = snapshot.xhr_count,
             fetch_count = snapshot.fetch_count,
             scanned_response_count = snapshot.scanned_response_count,
             truncated_response_count = snapshot.truncated_response_count,
             inline_manifest_count = snapshot.inline_manifest_count,
             candidate_count = media_urls.len(),
-            has_blob_video = snapshot.has_blob_video,
             has_license_resource = snapshot.has_license_resource,
-            remaining_budget_ms = deadline.saturating_duration_since(Instant::now()).as_millis(),
+            active_remaining_ms = active_deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis(),
+            hard_remaining_ms = deadline.saturating_duration_since(Instant::now()).as_millis(),
             "Minimal iQiyi player-bootstrap observation completed"
         );
 
@@ -525,6 +558,7 @@ async fn poll_bootstrap(
                     })?;
                 let snapshot: BootstrapSnapshot = serde_json::from_str(serialized)
                     .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
+                let provider_request_count = snapshot.xhr_count.saturating_add(snapshot.fetch_count);
 
                 tracing::info!(
                     target: "synctv_media_providers::browser_session",
@@ -533,16 +567,14 @@ async fn poll_bootstrap(
                     attempt = attempts,
                     elapsed_ms = started.elapsed().as_millis(),
                     ready_state = %snapshot.ready_state,
-                    resource_count = snapshot.resource_count,
+                    provider_request_count,
                     xhr_count = snapshot.xhr_count,
                     fetch_count = snapshot.fetch_count,
                     scanned_response_count = snapshot.scanned_response_count,
                     truncated_response_count = snapshot.truncated_response_count,
                     inline_manifest_count = snapshot.inline_manifest_count,
                     candidate_count = snapshot.candidate_urls.len(),
-                    video_element_count = snapshot.video_element_count,
-                    has_blob_video = snapshot.has_blob_video,
-                    "Polling only the small bootstrap capture state"
+                    "Polling only the tiny bootstrap capture state"
                 );
 
                 if !snapshot.candidate_urls.is_empty() || snapshot.has_license_resource {
@@ -918,22 +950,16 @@ fn host_mem_total_kib() -> Option<u64> {
 fn bootstrap_snapshot_script() -> &'static str {
     r#"(() => {
         const state = window.__synctvIqiyiBootstrap || {};
-        const videos = document.querySelectorAll('video');
-        const sources = document.querySelectorAll('source');
         return JSON.stringify({
             currentUrl: location.href || '',
             title: document.title || '',
             readyState: document.readyState || '',
-            resourceCount: performance.getEntriesByType('resource').length,
-            videoElementCount: videos.length,
-            sourceElementCount: sources.length,
             candidateUrls: Array.isArray(state.candidateUrls) ? state.candidateUrls : [],
             xhrCount: Number(state.xhrCount) || 0,
             fetchCount: Number(state.fetchCount) || 0,
             scannedResponseCount: Number(state.scannedResponseCount) || 0,
             truncatedResponseCount: Number(state.truncatedResponseCount) || 0,
             inlineManifestCount: Number(state.inlineManifestCount) || 0,
-            hasBlobVideo: Array.from(videos).some((video) => String(video.currentSrc || video.src || '').startsWith('blob:')),
             hasLicenseResource: state.hasLicenseResource === true
         });
     })()"#
@@ -945,6 +971,8 @@ fn bootstrap_hook_script() -> &'static str {
         const MAX_XHR_CHARS = 262144;
         const MAX_FETCH_BYTES = 65536;
         const MAX_CANDIDATES = 24;
+        const MAX_JSON_NODES = 1500;
+        const MEDIA_KEY_RE = /(?:m3u8|mpd|play.?url|stream.?url|video.?url|media.?url|playback.?url)/i;
         const state = window.__synctvIqiyiBootstrap = {
             candidateUrls: [],
             xhrCount: 0,
@@ -968,18 +996,46 @@ fn bootstrap_hook_script() -> &'static str {
             .replace(/\\u002f/gi, '/')
             .replace(/\\u0026/gi, '&')
             .replace(/\\u003d/gi, '=')
-            .replace(/\\\//g, '/');
-        const keepUrl = (raw) => {
+            .replace(/\\x3a/gi, ':')
+            .replace(/\\x2f/gi, '/')
+            .replace(/\\x26/gi, '&')
+            .replace(/\\x3d/gi, '=')
+            .replace(/\\\//g, '/')
+            .replace(/&amp;/gi, '&');
+        const keepUrl = (raw, trustedMediaField = false) => {
             if (state.candidateUrls.length >= MAX_CANDIDATES) return;
             try {
                 const value = new URL(String(raw || ''), location.href);
                 if (value.protocol !== 'http:' && value.protocol !== 'https:') return;
                 const lower = value.href.toLowerCase();
-                if (!/(?:\.m3u8|\.mpd|\.mp4|\.m4s|\.ts)(?:[?#]|$)/i.test(lower)) return;
+                if (!trustedMediaField && !/(?:\.m3u8|\.mpd|\.mp4|\.m4s|\.ts)(?:[?#]|$)/i.test(lower)) return;
                 if (seen.has(value.href)) return;
                 seen.add(value.href);
                 state.candidateUrls.push(value.href);
             } catch (_) {}
+        };
+        const scanJson = (value, keyHint, depth, budget) => {
+            if (budget.count <= 0 || depth > 8 || state.candidateUrls.length >= MAX_CANDIDATES) return;
+            budget.count -= 1;
+            if (typeof value === 'string') {
+                const text = value.trim();
+                if (MEDIA_KEY_RE.test(keyHint || '') && /^(?:https?:)?\/\//i.test(text)) {
+                    keepUrl(text, true);
+                }
+                return;
+            }
+            if (!value || typeof value !== 'object') return;
+            if (Array.isArray(value)) {
+                for (const item of value) {
+                    scanJson(item, keyHint, depth + 1, budget);
+                    if (budget.count <= 0 || state.candidateUrls.length >= MAX_CANDIDATES) break;
+                }
+                return;
+            }
+            for (const [key, child] of Object.entries(value)) {
+                scanJson(child, key, depth + 1, budget);
+                if (budget.count <= 0 || state.candidateUrls.length >= MAX_CANDIDATES) break;
+            }
         };
         const scan = (rawText) => {
             if (!rawText) return;
@@ -995,7 +1051,48 @@ fn bootstrap_hook_script() -> &'static str {
                 state.hasLicenseResource = true;
             }
             const absolute = /(?:https?:)?\/\/[^\s\"'<>\\]+?(?:\.m3u8|\.mpd|\.mp4|\.m4s|\.ts)(?:\?[^\s\"'<>\\]*)?/gi;
-            for (const match of text.matchAll(absolute)) keepUrl(match[0]);
+            for (const match of text.matchAll(absolute)) keepUrl(match[0], false);
+            const trimmed = text.trimStart();
+            if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+                try {
+                    scanJson(JSON.parse(text), '', 0, { count: MAX_JSON_NODES });
+                } catch (_) {}
+            }
+        };
+        const readFetchTextLimited = async (response) => {
+            const body = response && response.body;
+            if (!body || typeof body.getReader !== 'function') {
+                const text = String(await response.text());
+                if (text.length > MAX_FETCH_BYTES) state.truncatedResponseCount += 1;
+                return text.slice(0, MAX_FETCH_BYTES);
+            }
+            const reader = body.getReader();
+            const decoder = new TextDecoder();
+            let text = '';
+            let total = 0;
+            try {
+                while (total < MAX_FETCH_BYTES) {
+                    const result = await reader.read();
+                    if (result.done) break;
+                    const value = result.value || new Uint8Array();
+                    const remaining = MAX_FETCH_BYTES - total;
+                    const chunk = value.byteLength > remaining ? value.subarray(0, remaining) : value;
+                    total += chunk.byteLength;
+                    text += decoder.decode(chunk, { stream: total < MAX_FETCH_BYTES });
+                    if (value.byteLength > remaining) {
+                        state.truncatedResponseCount += 1;
+                        break;
+                    }
+                }
+                text += decoder.decode();
+            } catch (_) {
+                return text;
+            } finally {
+                try {
+                    await reader.cancel();
+                } catch (_) {}
+            }
+            return text;
         };
 
         const Xhr = window.XMLHttpRequest;
@@ -1013,6 +1110,8 @@ fn bootstrap_hook_script() -> &'static str {
                         try {
                             if (this.responseType === '' || this.responseType === 'text') {
                                 scan(this.responseText || '');
+                            } else if (this.responseType === 'json' && this.response != null) {
+                                scan(JSON.stringify(this.response));
                             }
                         } catch (_) {}
                     }, { once: true });
@@ -1032,8 +1131,10 @@ fn bootstrap_hook_script() -> &'static str {
                     try {
                         const contentLength = Number(response.headers.get('content-length') || 0);
                         const contentType = String(response.headers.get('content-type') || '').toLowerCase();
-                        if (contentLength > 0 && contentLength <= MAX_FETCH_BYTES && /(json|text|javascript)/.test(contentType)) {
-                            response.clone().text().then(scan).catch(() => {});
+                        if (contentLength > MAX_FETCH_BYTES) {
+                            state.truncatedResponseCount += 1;
+                        } else if (/(json|text|javascript)/.test(contentType)) {
+                            readFetchTextLimited(response.clone()).then(scan).catch(() => {});
                         }
                     } catch (_) {}
                     return response;
@@ -1065,9 +1166,19 @@ mod tests {
         let script = bootstrap_hook_script();
         assert!(script.contains("MAX_XHR_CHARS"));
         assert!(script.contains("MAX_FETCH_BYTES"));
-        assert!(script.contains("data" ) || script.contains("iqiyi"));
+        assert!(script.contains("MAX_JSON_NODES"));
+        assert!(script.contains("getReader"));
+        assert!(script.contains("MEDIA_KEY_RE"));
         assert!(!script.contains("document.cookie"));
         assert!(!script.contains("responseURL"));
+    }
+
+    #[test]
+    fn bootstrap_snapshot_stays_constant_cost() {
+        let script = bootstrap_snapshot_script();
+        assert!(!script.contains("querySelectorAll"));
+        assert!(!script.contains("getEntriesByType"));
+        assert!(script.contains("__synctvIqiyiBootstrap"));
     }
 
     #[test]
