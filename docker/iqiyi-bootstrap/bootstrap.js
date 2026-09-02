@@ -11,6 +11,22 @@
   const seen = new Set();
   let reservedResponses = 0;
 
+  const attachMarker = () => {
+    const marker = document.createElement('source');
+    marker.setAttribute('data-synctv-iqiyi-bootstrap-hook', '1');
+    marker.hidden = true;
+    const attach = () => {
+      const parent = document.documentElement || document.head || document.body;
+      if (parent) {
+        parent.appendChild(marker);
+      } else {
+        setTimeout(attach, 0);
+      }
+    };
+    attach();
+  };
+  attachMarker();
+
   const normalizeText = (value) => String(value || '')
     .slice(0, MAX_BODY_BYTES)
     .replace(/\\u003a/gi, ':')
