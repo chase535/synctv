@@ -3,16 +3,16 @@
   window.__synctvIqiyiBootstrapHookInstalled = true;
 
   const MAX_RESPONSES = 8;
-  const MAX_BODY_CHARS = 262144;
+  const MAX_BODY_BYTES = 262144;
   const MAX_MEDIA_URLS = 12;
   const MEDIA_URL_RE = /(?:https?:)?\/\/[^\s\"'<>\\]+?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?/gi;
   const MEDIA_KEY_RE = /(?:m3u8|mpd|play.?url|stream.?url|video.?url|media.?url)/i;
   const IMPORTANT_PATH_RE = /(?:\/dash(?:[/?#]|$)|\/jp\/|\/videos?\/|play|stream|manifest)/i;
   const seen = new Set();
-  let inspectedResponses = 0;
+  let reservedResponses = 0;
 
   const normalizeText = (value) => String(value || '')
-    .slice(0, MAX_BODY_CHARS)
+    .slice(0, MAX_BODY_BYTES)
     .replace(/\\u003a/gi, ':')
     .replace(/\\u002f/gi, '/')
     .replace(/\\u0026/gi, '&')
@@ -44,6 +44,12 @@
     if (!url || !isProviderUrl(url.href)) return false;
     const host = url.hostname.toLowerCase();
     return host.includes('video.') || host.startsWith('video.') || host.startsWith('cache.') || IMPORTANT_PATH_RE.test(url.pathname);
+  };
+
+  const reserveResponse = (url) => {
+    if (reservedResponses >= MAX_RESPONSES || !isInterestingResponse(url)) return false;
+    reservedResponses += 1;
+    return true;
   };
 
   const attachSource = (href) => {
@@ -112,10 +118,36 @@
     } catch (_) {}
   };
 
-  const inspectText = (url, text) => {
-    if (inspectedResponses >= MAX_RESPONSES || !isInterestingResponse(url)) return;
-    inspectedResponses += 1;
-    scanText(text, true);
+  const readTextLimited = async (response) => {
+    const body = response && response.body;
+    if (!body || typeof body.getReader !== 'function') {
+      return String(await response.text()).slice(0, MAX_BODY_BYTES);
+    }
+
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let text = '';
+    let total = 0;
+    try {
+      while (total < MAX_BODY_BYTES) {
+        const result = await reader.read();
+        if (result.done) break;
+        const value = result.value || new Uint8Array();
+        const remaining = MAX_BODY_BYTES - total;
+        const chunk = value.byteLength > remaining ? value.subarray(0, remaining) : value;
+        total += chunk.byteLength;
+        text += decoder.decode(chunk, { stream: total < MAX_BODY_BYTES });
+        if (value.byteLength > remaining) break;
+      }
+      text += decoder.decode();
+    } catch (_) {
+      return text;
+    } finally {
+      try {
+        await reader.cancel();
+      } catch (_) {}
+    }
+    return text;
   };
 
   const nativeFetch = window.fetch;
@@ -125,10 +157,10 @@
       return Promise.resolve(result).then((response) => {
         try {
           const url = response && response.url ? response.url : String(args[0] || '');
-          if (inspectedResponses < MAX_RESPONSES && isInterestingResponse(url)) {
+          if (reserveResponse(url)) {
             const length = Number(response.headers && response.headers.get('content-length')) || 0;
-            if (length <= MAX_BODY_CHARS) {
-              response.clone().text().then((text) => inspectText(url, text)).catch(() => {});
+            if (length === 0 || length <= MAX_BODY_BYTES) {
+              readTextLimited(response.clone()).then((text) => scanText(text, true)).catch(() => {});
             }
           }
         } catch (_) {}
@@ -152,14 +184,13 @@
 
   XMLHttpRequest.prototype.send = function (...args) {
     const url = this[xhrUrl] || '';
-    if (inspectedResponses < MAX_RESPONSES && isInterestingResponse(url)) {
+    if (reserveResponse(url)) {
       this.addEventListener('loadend', () => {
         try {
-          if (inspectedResponses >= MAX_RESPONSES) return;
           if (this.responseType === '' || this.responseType === 'text') {
-            inspectText(url, this.responseText || '');
+            scanText(this.responseText || '', true);
           } else if (this.responseType === 'json' && this.response != null) {
-            inspectText(url, JSON.stringify(this.response));
+            scanText(JSON.stringify(this.response), true);
           }
         } catch (_) {}
       }, { once: true });
