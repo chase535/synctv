@@ -124,7 +124,7 @@ impl ChromiumProcess {
         let started = Instant::now();
         let kill_started = Instant::now();
         let kill_requested = self.child.start_kill().is_ok();
-        let wait_finished = tokio::time::timeout(Duration::from_secs(1), self.child.wait())
+        let wait_finished = response_first_timeout(Duration::from_secs(1), self.child.wait())
             .await
             .is_ok();
         let kill_wait_ms = kill_started.elapsed().as_millis();
@@ -224,6 +224,20 @@ fn schedule_profile_cleanup(profile_dir: PathBuf, page_host: String) {
     });
 }
 
+async fn response_first_timeout<T>(
+    timeout: Duration,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, ()> {
+    tokio::pin!(future);
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    tokio::select! {
+        biased;
+        output = &mut future => Ok(output),
+        () = &mut deadline => Err(()),
+    }
+}
+
 struct CdpPipe {
     input: ChildStdin,
     output: ChildStdout,
@@ -298,7 +312,7 @@ pub async fn render_web_page_playback(
     log_container_resources("render_requested", &page_host);
 
     let queue_started = Instant::now();
-    let permit = tokio::time::timeout(BROWSER_QUEUE_TIMEOUT, BROWSER_RENDER_SEMAPHORE.acquire())
+    let permit = response_first_timeout(BROWSER_QUEUE_TIMEOUT, BROWSER_RENDER_SEMAPHORE.acquire())
         .await
         .map_err(|_| {
             ProviderClientError::Network(format!(
@@ -318,14 +332,14 @@ pub async fn render_web_page_playback(
     );
 
     let render_started = Instant::now();
-    let result = match tokio::time::timeout(
+    let result = match response_first_timeout(
         BROWSER_RENDER_TIMEOUT,
         render_web_page_playback_inner(raw_url, allowed_domains, cookies, single_process),
     )
     .await
     {
         Ok(result) => result,
-        Err(_) => {
+        Err(()) => {
             let elapsed = render_started.elapsed();
             let overshoot = elapsed.saturating_sub(BROWSER_RENDER_TIMEOUT);
             tracing::warn!(
@@ -502,13 +516,21 @@ async fn render_web_page_playback_inner(
             images_disabled = true,
             browser_level_cookie_install = true,
             interactive_probe = true,
+            navigation_ack_waited = false,
+            response_first_deadlines = true,
             transport = "pipe",
             flattened_session = true,
             "Authenticated browser page render diagnostics"
         );
 
+        // Page.navigate only needs to be dispatched. Waiting for its acknowledgement
+        // creates a false-failure window on the 1-core host: the latest deployment
+        // configured a 6 s command timeout but Tokio was not scheduled again until
+        // 12.5 s later while unrelated SQL operations were also delayed by 7-8 s.
+        // Subsequent Runtime.evaluate probes naturally serialize behind navigation;
+        // any late Page.navigate acknowledgement is harmlessly skipped by command id.
         let navigate_started = Instant::now();
-        cdp_call(
+        let navigation_command_id = cdp_send_command(
             &mut pipe,
             &mut command_id,
             Some(&session_id),
@@ -520,6 +542,8 @@ async fn render_web_page_playback_inner(
             target: "synctv_media_providers::browser_session",
             stage = "navigation_started",
             page_host = %page_host,
+            navigation_command_id,
+            ack_waited = false,
             elapsed_ms = navigate_started.elapsed().as_millis(),
             render_elapsed_ms = startup_started.elapsed().as_millis(),
             "Authenticated browser page render diagnostics"
@@ -734,6 +758,29 @@ fn first_page_target_id(targets: &Value) -> Option<String> {
         })
 }
 
+async fn cdp_send_command(
+    pipe: &mut CdpPipe,
+    command_id: &mut u64,
+    session_id: Option<&str>,
+    method: &str,
+    params: Value,
+) -> Result<u64, ProviderClientError> {
+    *command_id = command_id.saturating_add(1);
+    let current_id = *command_id;
+    let mut payload = json!({
+        "id": current_id,
+        "method": method,
+        "params": params,
+    });
+    if let Some(session_id) = session_id {
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("sessionId".to_string(), json!(session_id));
+        }
+    }
+    pipe.send(&payload).await?;
+    Ok(current_id)
+}
+
 async fn cdp_call(
     pipe: &mut CdpPipe,
     command_id: &mut u64,
@@ -760,29 +807,19 @@ async fn cdp_call_with_timeout(
     params: Value,
     timeout: Duration,
 ) -> Result<Value, ProviderClientError> {
-    *command_id = command_id.saturating_add(1);
-    let current_id = *command_id;
-    let mut payload = json!({
-        "id": current_id,
-        "method": method,
-        "params": params,
-    });
-    if let Some(session_id) = session_id {
-        if let Some(object) = payload.as_object_mut() {
-            object.insert("sessionId".to_string(), json!(session_id));
-        }
-    }
-
+    let current_id = cdp_send_command(pipe, command_id, session_id, method, params).await?;
     let started = Instant::now();
-    pipe.send(&payload).await?;
-    let result = tokio::time::timeout(timeout, async {
+    let mut skipped_response_count = 0_usize;
+    let result = response_first_timeout(timeout, async {
         loop {
             let response = pipe.receive().await?;
             if response.get("id").and_then(Value::as_u64) != Some(current_id) {
+                skipped_response_count = skipped_response_count.saturating_add(1);
                 continue;
             }
             if let Some(expected_session) = session_id {
                 if response.get("sessionId").and_then(Value::as_str) != Some(expected_session) {
+                    skipped_response_count = skipped_response_count.saturating_add(1);
                     continue;
                 }
             }
@@ -799,7 +836,21 @@ async fn cdp_call_with_timeout(
     match result {
         Ok(inner) => {
             let elapsed = started.elapsed();
-            if elapsed >= CDP_SLOW_COMMAND_THRESHOLD {
+            let deadline_overshoot = elapsed.saturating_sub(timeout);
+            if elapsed > timeout {
+                tracing::info!(
+                    target: "synctv_media_providers::browser_session",
+                    stage = "cdp_command_late_success",
+                    method,
+                    success = inner.is_ok(),
+                    elapsed_ms = elapsed.as_millis(),
+                    timeout_ms = timeout.as_millis(),
+                    deadline_overshoot_ms = deadline_overshoot.as_millis(),
+                    skipped_response_count,
+                    transport = "pipe",
+                    "Chromium CDP command completed after its nominal deadline because the response was ready when the executor resumed"
+                );
+            } else if elapsed >= CDP_SLOW_COMMAND_THRESHOLD {
                 tracing::info!(
                     target: "synctv_media_providers::browser_session",
                     stage = "cdp_command_slow",
@@ -807,19 +858,23 @@ async fn cdp_call_with_timeout(
                     success = inner.is_ok(),
                     elapsed_ms = elapsed.as_millis(),
                     timeout_ms = timeout.as_millis(),
+                    skipped_response_count,
                     transport = "pipe",
                     "Chromium CDP command diagnostics"
                 );
             }
             inner
         }
-        Err(_) => {
+        Err(()) => {
+            let elapsed = started.elapsed();
             tracing::warn!(
                 target: "synctv_media_providers::browser_session",
                 stage = "cdp_command_timeout",
                 method,
-                elapsed_ms = started.elapsed().as_millis(),
+                elapsed_ms = elapsed.as_millis(),
                 timeout_ms = timeout.as_millis(),
+                timeout_overshoot_ms = elapsed.saturating_sub(timeout).as_millis(),
+                skipped_response_count,
                 transport = "pipe",
                 "Chromium CDP command diagnostics"
             );
