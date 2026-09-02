@@ -18,6 +18,7 @@ const BROWSER_EMPTY_OBSERVATION_CACHE_CAPACITY: u64 = 16;
 const BROWSER_EMPTY_OBSERVATION_CACHE_TTL: Duration = Duration::from_secs(30);
 const BROWSER_FAILURE_BACKOFF_CAPACITY: u64 = 16;
 const BROWSER_FAILURE_BACKOFF_TTL: Duration = Duration::from_secs(30);
+const CANCELLED_RENDER_MESSAGE: &str = "browser discovery was cancelled before completion";
 
 static BROWSER_OBSERVATION_CACHE: LazyLock<Cache<String, BrowserPageObservation>> =
     LazyLock::new(|| {
@@ -47,6 +48,51 @@ static BROWSER_FAILURE_BACKOFF: LazyLock<Cache<String, String>> = LazyLock::new(
         .build()
 });
 
+struct RenderCancellationGuard {
+    cache_key: String,
+    page_host: String,
+    armed: bool,
+}
+
+impl RenderCancellationGuard {
+    fn new(cache_key: String, page_host: String) -> Self {
+        Self {
+            cache_key,
+            page_host,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RenderCancellationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let cache_key = self.cache_key.clone();
+        let page_host = self.page_host.clone();
+        let _backoff_task = runtime.spawn(async move {
+            BROWSER_FAILURE_BACKOFF
+                .insert(cache_key, CANCELLED_RENDER_MESSAGE.to_string())
+                .await;
+            tracing::warn!(
+                target: "synctv_media_providers::browser_session",
+                stage = "cancelled_render_backoff_armed",
+                page_host = %page_host,
+                backoff_ttl_secs = BROWSER_FAILURE_BACKOFF_TTL.as_secs(),
+                "Cancelled Chromium work will suppress an immediate replacement launch"
+            );
+        });
+    }
+}
+
 /// Render a provider page while coalescing duplicate authenticated browser work.
 ///
 /// Playback startup may validate the same source through preflight, duration
@@ -60,7 +106,9 @@ static BROWSER_FAILURE_BACKOFF: LazyLock<Cache<String, String>> = LazyLock::new(
 /// Moka's `try_get_with` coalesces concurrent misses for the same key. Successful
 /// observations with media are cached briefly. Successful rendered observations
 /// with no media receive a slightly longer negative cache, while failed renders
-/// arm a short cookie-scoped backoff. All three protections expire automatically.
+/// arm a short cookie-scoped backoff. If an outer request deadline cancels the
+/// render future before it can return a Result, a drop guard arms the same short
+/// backoff so the next click cannot immediately start another Chromium process.
 pub async fn render_web_page_playback(
     raw_url: &str,
     allowed_domains: &'static [&'static str],
@@ -116,10 +164,15 @@ pub async fn render_web_page_playback(
     let cookies = cookies.to_vec();
     let key_for_failure = cache_key.clone();
     let key_for_empty = cache_key.clone();
+    let key_for_cancellation = cache_key.clone();
     let render_page_host = page_host.clone();
     let result = BROWSER_OBSERVATION_CACHE
         .try_get_with(cache_key, async move {
             let started_at = Instant::now();
+            let mut cancellation_guard = RenderCancellationGuard::new(
+                key_for_cancellation,
+                render_page_host.clone(),
+            );
             tracing::info!(
                 target: "synctv_media_providers::browser_session",
                 stage = "cache_miss_leader",
@@ -128,11 +181,13 @@ pub async fn render_web_page_playback(
                 cache_ttl_secs = BROWSER_OBSERVATION_CACHE_TTL.as_secs(),
                 empty_cache_ttl_secs = BROWSER_EMPTY_OBSERVATION_CACHE_TTL.as_secs(),
                 failure_backoff_secs = BROWSER_FAILURE_BACKOFF_TTL.as_secs(),
+                cancellation_backoff = true,
                 "Authenticated browser page render diagnostics"
             );
 
             let result =
                 implementation::render_web_page_playback(&raw_url, allowed_domains, &cookies).await;
+            cancellation_guard.disarm();
 
             match &result {
                 Ok(observation) => tracing::info!(
