@@ -115,24 +115,17 @@ LABEL org.opencontainers.image.title="SyncTV" \
     org.opencontainers.image.source="https://github.com/synctv-org/synctv" \
     org.opencontainers.image.licenses="MIT"
 
-# Install runtime dependencies. Chromium is used only as the authenticated
-# web-session fallback when static provider HTML does not expose media.
+# Chromium is only a short-lived authenticated bootstrap helper when the cheap
+# static provider path does not expose media. The Rust CDP path injects one
+# bounded page hook before navigation; no browser extension or playback engine
+# is kept alive.
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     chromium \
     curl && rm -rf /var/lib/apt/lists/*
 
-# Keep iQiyi bootstrap inspection inside the page process instead of enabling
-# the CDP Network domain. The tiny extension runs only on iqiyi/qiyi pages,
-# inspects at most a handful of provider fetch/XHR response bodies with strict
-# size limits, and publishes only direct HTTP(S) media candidates as inert
-# standalone <source> elements. The existing probe can therefore discover them
-# without shipping response bodies, cookies, or signed query strings over CDP.
-COPY docker/iqiyi-bootstrap /usr/local/share/synctv-iqiyi-bootstrap
 COPY docker/synctv-chromium.sh /usr/local/bin/synctv-chromium
-RUN chmod 0755 /usr/local/bin/synctv-chromium && \
-    chmod 0644 /usr/local/share/synctv-iqiyi-bootstrap/manifest.json \
-        /usr/local/share/synctv-iqiyi-bootstrap/bootstrap.js
+RUN chmod 0755 /usr/local/bin/synctv-chromium
 
 # Keep Chromium discovery deterministic inside Docker and reduce allocator
 # growth on memory-constrained hosts. Two Tokio workers preserve timer/SQL/
