@@ -889,7 +889,7 @@ async fn wait_for_browser_signal(
     pipe: &mut CdpPipe,
     command_id: &mut u64,
     session_id: &str,
-    page_host: &str,
+    expected_page_host: &str,
 ) -> Result<BrowserProbeOutcome, ProviderClientError> {
     let started = Instant::now();
     let mut attempts = 0_usize;
@@ -919,7 +919,7 @@ async fn wait_for_browser_signal(
                     tracing::warn!(
                         target: "synctv_media_providers::browser_session",
                         stage = "page_probe_retry_failed",
-                        page_host = %page_host,
+                        page_host = %expected_page_host,
                         attempt = attempts,
                         elapsed_ms = started.elapsed().as_millis(),
                         previous_ready_state = %payload.ready_state,
@@ -954,7 +954,7 @@ async fn wait_for_browser_signal(
         tracing::info!(
             target: "synctv_media_providers::browser_session",
             stage = "page_probe",
-            page_host = %page_host,
+            page_host = %expected_page_host,
             current_host = %current_host,
             attempt = attempts,
             max_attempts = MAX_BROWSER_PROBE_ATTEMPTS,
