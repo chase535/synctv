@@ -126,11 +126,17 @@ RUN apt-get update && apt-get install -y \
 # permitted and a desktop-sized viewport is present. Keep those policy/layout
 # flags in a wrapper so browser_session can continue treating CHROMIUM_BIN as a
 # normal executable while every fallback launch gets the same deterministic
-# low-overhead playback environment. The wrapper does not bypass authentication;
-# the authenticated cookie jar is still installed by the provider session.
+# playback environment. The provider probe is a foreground-only, single-tab
+# workload, so disable Chromium's background renderer/timer deprioritization: on
+# the constrained host the page is visible but document.hasFocus() is false, and
+# letting Chromium background-throttle that renderer can make CDP evaluation
+# exceed its budget while the player is still bootstrapping. AutomationControlled
+# is also disabled so provider pages see normal browser WebDriver state instead of
+# taking a headless-only initialization path. Authentication is still supplied
+# solely by the user's provider cookie jar.
 RUN printf '%s\n' \
     '#!/bin/sh' \
-    'exec /usr/bin/chromium --autoplay-policy=no-user-gesture-required --window-size=1280,720 "$@"' \
+    'exec /usr/bin/chromium --autoplay-policy=no-user-gesture-required --window-size=1280,720 --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-blink-features=AutomationControlled "$@"' \
     > /usr/local/bin/synctv-chromium && \
     chmod 0755 /usr/local/bin/synctv-chromium
 
