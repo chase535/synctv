@@ -19,6 +19,7 @@ filter_and_exec() {
     --disable-backgrounding-occluded-windows \
     --disable-renderer-backgrounding \
     --disable-blink-features=AutomationControlled \
+    --disable-component-extensions-with-background-pages \
     --disable-extensions-except="$EXTENSION_DIR" \
     --load-extension="$EXTENSION_DIR" \
     "$@"
