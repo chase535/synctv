@@ -1597,4 +1597,11 @@ mod tests {
         assert!(!script.contains("document.cookie"));
         assert!(!script.contains("location.search"));
     }
+
+    #[test]
+    fn adaptive_probe_budget_keeps_shutdown_reserve() {
+        assert!(MAX_BROWSER_PROBE_ATTEMPTS >= 3);
+        assert!(BROWSER_RENDER_COMPLETION_RESERVE >= Duration::from_millis(1000));
+        assert!(CDP_PROBE_TIMEOUT < BROWSER_RENDER_TIMEOUT);
+    }
 }
