@@ -9,9 +9,9 @@ use crate::web_session::{
 };
 use crate::ProviderClientError;
 
-mod dash;
+mod tmts;
 
-pub const IQIYI_SESSION_DOMAINS: &[&str] = &["iqiyi.com", "qiyi.com"];
+pub const IQIYI_SESSION_DOMAINS: &[&str] = &["iqiyi.com", "qiyi.com", "iq.com"];
 
 const ABSOLUTE_MEDIA_PATTERN: &str =
     r#"(?i)(?:https?:)?//[^\s\"'<>\\]+?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?"#;
@@ -47,14 +47,13 @@ impl IqiyiClient {
         self.session.get_text(url).await
     }
 
-    /// Discover playable media with HTTP only.
+    /// Discover playable media using only small HTTP requests.
     ///
-    /// The normal authenticated page is fetched first because it is cheap and may
-    /// already expose a direct media URL. If it does not, the page's tvid/vid are
-    /// used to query iQiyi's dash metadata endpoint with the same authenticated
-    /// cookie jar. The request signature is computed locally; no Chromium,
-    /// JavaScript runtime, CDP connection, DRM license request, or media decoding
-    /// process is started.
+    /// The authenticated page and serialized HTML remain the cheapest path. If
+    /// they expose no media, SyncTV resolves the page identifiers and queries
+    /// iQiyi's TMTS metadata endpoint. The request uses the existing scoped cookie
+    /// jar and a small MD5 timestamp signature; no Chromium, JavaScript runtime,
+    /// CDP connection, media decoder, or DRM-license request is started.
     pub async fn discover_playback(
         &self,
         url: &str,
@@ -67,17 +66,17 @@ impl IqiyiClient {
         log_static_diagnostics(&page_url, &html, &discovery);
 
         if discovery.media_urls.is_empty() && !discovery.drm_detected {
-            match dash::discover_dash_media(&self.session, &page_url, &html).await {
-                Ok(dash_discovery) => {
-                    merge_dash_discovery(&mut discovery, dash_discovery);
+            match tmts::discover_tmts_media(&self.session, &page_url, &html).await {
+                Ok(tmts_discovery) => {
+                    merge_tmts_discovery(&mut discovery, tmts_discovery);
                     prioritize_full_hd_or_better(&mut discovery.media_urls);
                 }
                 Err(error) => tracing::warn!(
                     target: "synctv_media_providers::iqiyi",
-                    stage = "dash_http_failed",
+                    stage = "tmts_http_failed",
                     page_host = page_url.host_str().unwrap_or(""),
                     error = %error,
-                    "Pure HTTP iQiyi dash discovery failed"
+                    "Pure HTTP iQiyi TMTS discovery failed"
                 ),
             }
         }
@@ -179,13 +178,13 @@ fn push_media_candidate(
     }
 }
 
-fn merge_dash_discovery(
+fn merge_tmts_discovery(
     discovery: &mut WebPagePlaybackDiscovery,
-    dash_discovery: dash::DashDiscovery,
+    tmts_discovery: tmts::TmtsDiscovery,
 ) {
-    discovery.drm_detected |= dash_discovery.drm_detected;
+    discovery.drm_detected |= tmts_discovery.drm_detected;
     let mut seen = discovery.media_urls.iter().cloned().collect::<HashSet<_>>();
-    for url in dash_discovery.media_urls {
+    for url in tmts_discovery.media_urls {
         if seen.insert(url.clone()) {
             discovery.media_urls.push(url);
         }
@@ -206,7 +205,7 @@ fn log_static_diagnostics(page_url: &Url, html: &str, discovery: &WebPagePlaybac
         has_mp4 = lower.contains(".mp4"),
         has_video_tag = lower.contains("<video"),
         has_tv_id = lower.contains("tvid") || lower.contains("tv_id"),
-        strategy = "static_then_signed_http_dash",
+        strategy = "static_then_http_tmts",
         "iQiyi playback discovery diagnostics"
     );
 }
