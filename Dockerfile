@@ -131,9 +131,13 @@ RUN chmod 0755 /usr/local/bin/synctv-chromium
 # growth on memory-constrained hosts. Two Tokio workers preserve timer/SQL/
 # WebSocket liveness if one worker is briefly delayed by kernel or filesystem
 # pressure on a single-core VPS; this does not create additional CPU capacity.
-# Chromium itself is launched with --disable-dev-shm-usage because Docker's
-# default /dev/shm is typically small.
+# Do not force Chromium --single-process here: real low-memory traces showed
+# that sharing the browser/renderer process starves the official provider page
+# badly enough that even tiny Runtime.evaluate calls stop making progress.
+# Renderer count is still capped at one by the Rust launcher, so normal process
+# separation trades a modest amount of RAM for substantially better scheduling.
 ENV CHROMIUM_BIN=/usr/local/bin/synctv-chromium \
+    SYNCTV_CHROMIUM_SINGLE_PROCESS=false \
     MALLOC_ARENA_MAX=2 \
     TOKIO_WORKER_THREADS=2
 
