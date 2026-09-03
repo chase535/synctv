@@ -11,7 +11,7 @@ use crate::ProviderClientError;
 
 mod tmts;
 
-pub const IQIYI_SESSION_DOMAINS: &[&str] = &["iqiyi.com", "qiyi.com", "iq.com"];
+pub const IQIYI_SESSION_DOMAINS: &[&str] = &["iqiyi.com", "qiyi.com"];
 
 const ABSOLUTE_MEDIA_PATTERN: &str =
     r#"(?i)(?:https?:)?//[^\s\"'<>\\]+?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?"#;
