@@ -115,12 +115,18 @@ LABEL org.opencontainers.image.title="SyncTV" \
     org.opencontainers.image.source="https://github.com/synctv-org/synctv" \
     org.opencontainers.image.licenses="MIT"
 
-# Install runtime dependencies. Chromium is used only as the authenticated
-# web-session fallback when static provider HTML does not expose media.
+# Provider playback discovery is HTTP-only. Keep the runtime image small and do
+# not install a browser just to resolve provider metadata.
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    chromium \
     curl && rm -rf /var/lib/apt/lists/*
+
+# Two Tokio workers preserve timer/SQL/WebSocket liveness on a single-core VPS
+# when one worker is briefly delayed by kernel or filesystem pressure. This does
+# not create additional CPU capacity. MALLOC_ARENA_MAX only constrains libc
+# consumers because the SyncTV binary itself uses mimalloc in this image.
+ENV MALLOC_ARENA_MAX=2 \
+    TOKIO_WORKER_THREADS=2
 
 # Create synctv for running the application
 RUN useradd -m -u 1000 synctv
@@ -139,8 +145,8 @@ COPY --from=builder /synctv /usr/local/bin/synctv
 # Switch to non-root user
 USER synctv
 
-# Verify PATH resolution and runtime dependencies using the production user.
-RUN command -v synctv && synctv --version && command -v chromium
+# Verify PATH resolution and the only required runtime helper.
+RUN command -v synctv && synctv --version && command -v curl
 
 # Expose ports
 # 8080: HTTP API + public gRPC (also serves HLS via /api/room/movie/live/hls/*)

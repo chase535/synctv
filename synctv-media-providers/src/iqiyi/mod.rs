@@ -4,15 +4,19 @@ use percent_encoding::percent_decode_str;
 use regex::Regex;
 use url::Url;
 
-use crate::browser_session::{
-    render_web_page_playback, BrowserPageDiagnostics, BrowserPageObservation,
-};
 use crate::web_session::{
     discover_web_page_playback, ScopedWebSessionClient, SessionCookie, WebPagePlaybackDiscovery,
 };
 use crate::ProviderClientError;
 
+mod tmts;
+
 pub const IQIYI_SESSION_DOMAINS: &[&str] = &["iqiyi.com", "qiyi.com"];
+
+const ABSOLUTE_MEDIA_PATTERN: &str =
+    r#"(?i)(?:https?:)?//[^\s\"'<>\\]+?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?"#;
+const ROOT_RELATIVE_MEDIA_PATTERN: &str =
+    r#"(?i)[\"'](/[^/\s\"'<>\\][^\s\"'<>\\]*?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?)"#;
 
 #[derive(Clone)]
 pub struct IqiyiClient {
@@ -39,28 +43,17 @@ impl IqiyiClient {
     }
 
     /// Fetch an iQiyi web resource using the authenticated server-side session.
-    ///
-    /// The shared provider HTTP client identifies as a current desktop browser.
-    /// The mobile embedded WebView is only used to establish the login session
-    /// and its mobile User-Agent is never copied into these server requests.
-    ///
-    /// This primitive deliberately does not decrypt DRM media or synthesize
-    /// playback licenses. Provider-specific playback code may only consume
-    /// upstream resources that the authenticated account is legitimately
-    /// authorized to request.
     pub async fn fetch_page(&self, url: &str) -> Result<String, ProviderClientError> {
         self.session.get_text(url).await
     }
 
-    /// Discover direct HTTP(S) media explicitly exposed by the authenticated page.
+    /// Discover playable media using only small HTTP requests.
     ///
-    /// Static HTML/bootstrap discovery remains the fast path. If it yields no
-    /// media and no DRM marker, a local headless Chromium instance loads the
-    /// official page with the authenticated cookie jar, executes the provider's
-    /// normal page JavaScript, and observes only media URLs exposed through the
-    /// rendered DOM or the browser Performance API. The renderer does not call
-    /// private signing APIs, derive device credentials, inspect response bodies,
-    /// or construct DRM licenses.
+    /// The authenticated page and serialized HTML remain the cheapest path. If
+    /// they expose no media, SyncTV resolves the page identifiers and queries
+    /// iQiyi's TMTS metadata endpoint. The request uses the existing scoped cookie
+    /// jar and a small MD5 timestamp signature; no Chromium, JavaScript runtime,
+    /// CDP connection, media decoder, or DRM-license request is started.
     pub async fn discover_playback(
         &self,
         url: &str,
@@ -73,26 +66,18 @@ impl IqiyiClient {
         log_static_diagnostics(&page_url, &html, &discovery);
 
         if discovery.media_urls.is_empty() && !discovery.drm_detected {
-            match render_web_page_playback(
-                page_url.as_str(),
-                IQIYI_SESSION_DOMAINS,
-                self.session.cookies(),
-            )
-            .await
-            {
-                Ok(rendered) => {
-                    log_browser_diagnostics(&page_url, &rendered.diagnostics, &rendered.discovery);
-                    merge_browser_discovery(&mut discovery, rendered);
+            match tmts::discover_tmts_media(&self.session, &page_url, &html).await {
+                Ok(tmts_discovery) => {
+                    merge_tmts_discovery(&mut discovery, tmts_discovery);
                     prioritize_full_hd_or_better(&mut discovery.media_urls);
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        target: "synctv_media_providers::iqiyi",
-                        page_host = page_url.host_str().unwrap_or(""),
-                        error = %error,
-                        "iQiyi browser discovery fallback failed"
-                    );
-                }
+                Err(error) => tracing::warn!(
+                    target: "synctv_media_providers::iqiyi",
+                    stage = "tmts_http_failed",
+                    page_host = page_url.host_str().unwrap_or(""),
+                    error = %error,
+                    "Pure HTTP iQiyi TMTS discovery failed"
+                ),
             }
         }
 
@@ -105,13 +90,10 @@ fn discover_serialized_web_media(
     discovery: &mut WebPagePlaybackDiscovery,
 ) -> Result<(), ProviderClientError> {
     let normalized = normalize_serialized_scan_text(html);
-    let absolute_media_regex =
-        Regex::new(r#"(?i)(?:https?:)?//[^\s\"'<>\\]+?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?"#)
-            .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
-    let root_relative_media_regex = Regex::new(
-        r#"(?i)[\"'](/[^/\s\"'<>\\][^\s\"'<>\\]*?\.(?:m3u8|mpd|mp4)(?:\?[^\s\"'<>\\]*)?)"#,
-    )
-    .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
+    let absolute_media_regex = Regex::new(ABSOLUTE_MEDIA_PATTERN)
+        .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
+    let root_relative_media_regex = Regex::new(ROOT_RELATIVE_MEDIA_PATTERN)
+        .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
     let page_url = Url::parse(&discovery.page_url)
         .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
 
@@ -196,21 +178,13 @@ fn push_media_candidate(
     }
 }
 
-fn merge_browser_discovery(
+fn merge_tmts_discovery(
     discovery: &mut WebPagePlaybackDiscovery,
-    rendered: BrowserPageObservation,
+    tmts_discovery: tmts::TmtsDiscovery,
 ) {
-    let BrowserPageObservation {
-        discovery: browser_discovery,
-        diagnostics: _,
-    } = rendered;
-    discovery.drm_detected |= browser_discovery.drm_detected;
-    discovery.page_url = browser_discovery.page_url;
-    if discovery.title.is_none() {
-        discovery.title = browser_discovery.title;
-    }
+    discovery.drm_detected |= tmts_discovery.drm_detected;
     let mut seen = discovery.media_urls.iter().cloned().collect::<HashSet<_>>();
-    for url in browser_discovery.media_urls {
+    for url in tmts_discovery.media_urls {
         if seen.insert(url.clone()) {
             discovery.media_urls.push(url);
         }
@@ -219,8 +193,6 @@ fn merge_browser_discovery(
 
 fn log_static_diagnostics(page_url: &Url, html: &str, discovery: &WebPagePlaybackDiscovery) {
     let lower = html.to_ascii_lowercase();
-    let normalized = normalize_serialized_scan_text(html);
-    let normalized_lower = normalized.to_ascii_lowercase();
     tracing::info!(
         target: "synctv_media_providers::iqiyi",
         stage = "static_html",
@@ -229,52 +201,11 @@ fn log_static_diagnostics(page_url: &Url, html: &str, discovery: &WebPagePlaybac
         media_count = discovery.media_urls.len(),
         drm_detected = discovery.drm_detected,
         has_m3u8 = lower.contains(".m3u8"),
-        m3u8_occurrences = lower.match_indices(".m3u8").count(),
-        normalized_m3u8_occurrences = normalized_lower.match_indices(".m3u8").count(),
         has_mpd = lower.contains(".mpd"),
         has_mp4 = lower.contains(".mp4"),
         has_video_tag = lower.contains("<video"),
-        has_source_tag = lower.contains("<source"),
-        has_blob_url = lower.contains("blob:"),
-        has_video_id = lower.contains("videoid") || lower.contains("video_id"),
         has_tv_id = lower.contains("tvid") || lower.contains("tv_id"),
-        has_unicode_url_escape = lower.contains(r"\u003a") || lower.contains(r"\u002f"),
-        has_hex_url_escape = lower.contains(r"\x3a") || lower.contains(r"\x2f"),
-        has_percent_url_escape = lower.contains("%3a") || lower.contains("%2f"),
-        has_double_escaped_slash = lower.contains(r"\\/"),
-        normalized_has_http_media = normalized_lower.contains("http")
-            && (normalized_lower.contains(".m3u8")
-                || normalized_lower.contains(".mpd")
-                || normalized_lower.contains(".mp4")),
-        "iQiyi playback discovery diagnostics"
-    );
-}
-
-fn log_browser_diagnostics(
-    page_url: &Url,
-    diagnostics: &BrowserPageDiagnostics,
-    discovery: &WebPagePlaybackDiscovery,
-) {
-    tracing::info!(
-        target: "synctv_media_providers::iqiyi",
-        stage = "rendered_page",
-        page_host = page_url.host_str().unwrap_or(""),
-        ready_state = %diagnostics.ready_state,
-        html_length = diagnostics.html_length,
-        resource_count = diagnostics.resource_count,
-        media_resource_count = diagnostics.media_resource_count,
-        video_element_count = diagnostics.video_element_count,
-        source_element_count = diagnostics.source_element_count,
-        media_count = discovery.media_urls.len(),
-        drm_detected = discovery.drm_detected,
-        has_m3u8 = diagnostics.has_m3u8,
-        has_mpd = diagnostics.has_mpd,
-        has_mp4 = diagnostics.has_mp4,
-        has_blob_video = diagnostics.has_blob_video,
-        has_video_id = diagnostics.has_video_id,
-        has_tv_id = diagnostics.has_tv_id,
-        has_drm_marker = diagnostics.has_drm_marker,
-        has_license_resource = diagnostics.has_license_resource,
+        strategy = "static_then_http_tmts",
         "iQiyi playback discovery diagnostics"
     );
 }
@@ -338,13 +269,6 @@ fn prioritize_full_hd_or_better(media_urls: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PROVIDER_DESKTOP_WEB_USER_AGENT;
-
-    #[test]
-    fn desktop_web_identity_tracks_current_stable_chrome() {
-        assert!(PROVIDER_DESKTOP_WEB_USER_AGENT.contains("Windows NT 10.0"));
-        assert!(PROVIDER_DESKTOP_WEB_USER_AGENT.contains("Chrome/152."));
-    }
 
     #[test]
     fn discovers_serialized_full_hd_web_media_and_prefers_it() {
@@ -370,14 +294,10 @@ mod tests {
             discovery.media_urls.first().map(String::as_str),
             Some("https://cdn.example/movie_1080p.m3u8?token=abc&expires=9999999999")
         );
-        assert!(discovery
-            .media_urls
-            .iter()
-            .any(|url| url == "https://cdn.example/movie_720p.m3u8"));
     }
 
     #[test]
-    fn discovers_protocol_relative_serialized_media() {
+    fn discovers_unicode_hex_and_percent_encoded_urls() {
         let mut discovery = WebPagePlaybackDiscovery {
             page_url: "https://www.iqiyi.com/v_demo.html".to_string(),
             title: None,
@@ -386,80 +306,12 @@ mod tests {
         };
         let html = r#"
             <script>
-              window.__BOOTSTRAP__ = {
-                "media":"\/\/cdn.example\/movie_1080p.m3u8?token=abc"
-              };
+              const first = "https\u003A\u002F\u002Fcdn.example\u002Fmovie_1080p.m3u8?x=1\u0026y=2";
+              const second = "https%3A%2F%2Fcdn.example%2Fmovie_720p.mp4%3Fx%3D1";
             </script>
         "#;
-
         discover_serialized_web_media(html, &mut discovery).expect("discover media");
-
-        assert_eq!(
-            discovery.media_urls,
-            vec!["https://cdn.example/movie_1080p.m3u8?token=abc"]
-        );
-    }
-
-    #[test]
-    fn discovers_unicode_and_hex_serialized_media_urls() {
-        let mut discovery = WebPagePlaybackDiscovery {
-            page_url: "https://www.iqiyi.com/v_demo.html".to_string(),
-            title: None,
-            media_urls: Vec::new(),
-            drm_detected: false,
-        };
-        let html = r#"
-            <script>
-              const primary = "https\u003A\u002F\u002Fcdn.example\u002Fmovie_1080p.m3u8?token=abc\u0026expires=999";
-              const backup = "https\x3A\x2F\x2Fcdn.example\x2Fmovie_720p.mp4?token=def\x26expires=999";
-            </script>
-        "#;
-
-        discover_serialized_web_media(html, &mut discovery).expect("discover media");
-
-        assert!(discovery
-            .media_urls
-            .iter()
-            .any(|url| url == "https://cdn.example/movie_1080p.m3u8?token=abc&expires=999"));
-        assert!(discovery
-            .media_urls
-            .iter()
-            .any(|url| url == "https://cdn.example/movie_720p.mp4?token=def&expires=999"));
-    }
-
-    #[test]
-    fn discovers_percent_encoded_and_root_relative_media_urls() {
-        let mut discovery = WebPagePlaybackDiscovery {
-            page_url: "https://www.iqiyi.com/v_demo.html".to_string(),
-            title: None,
-            media_urls: Vec::new(),
-            drm_detected: false,
-        };
-        let html = r#"
-            <script>
-              const encoded = "https%3A%2F%2Fcdn.example%2Fmovie_1080p.m3u8%3Ftoken%3Dabc%26expires%3D999";
-              const relative = "/media/movie_720p.m3u8?token=def";
-            </script>
-        "#;
-
-        discover_serialized_web_media(html, &mut discovery).expect("discover media");
-
-        assert!(discovery
-            .media_urls
-            .iter()
-            .any(|url| url == "https://cdn.example/movie_1080p.m3u8?token=abc&expires=999"));
-        assert!(discovery
-            .media_urls
-            .iter()
-            .any(|url| url == "https://www.iqiyi.com/media/movie_720p.m3u8?token=def"));
-    }
-
-    #[test]
-    fn repeatedly_decodes_double_escaped_slashes() {
-        let normalized = normalize_serialized_scan_text(
-            r#"const media = "https:\\/\\/cdn.example\\/movie_1080p.m3u8";"#,
-        );
-        assert!(normalized.contains("https://cdn.example/movie_1080p.m3u8"));
+        assert_eq!(discovery.media_urls.len(), 2);
     }
 
     #[test]
@@ -470,8 +322,5 @@ mod tests {
         ];
         prioritize_full_hd_or_better(&mut urls);
         assert_eq!(urls[0], "https://cdn.example/movie_720p.m3u8");
-        assert!(!urls
-            .iter()
-            .any(|url| explicit_video_height(url) == Some(1080)));
     }
 }

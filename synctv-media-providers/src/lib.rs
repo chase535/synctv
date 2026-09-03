@@ -27,8 +27,6 @@ mod credential;
 pub mod acfun;
 pub mod alist;
 pub mod bilibili;
-#[path = "browser_session_cached.rs"]
-pub mod browser_session;
 pub mod cctv;
 pub mod cloudreve;
 pub mod douyin;
@@ -75,11 +73,11 @@ pub use credential::{
     InMemoryCredentialStorage, ProviderType, Result as CredentialResult, StoredCredential,
 };
 
-/// Browser identity used for authenticated provider web pages.
+/// Desktop web identity used by provider HTTP sessions.
 ///
-/// Chrome 152 is the current stable desktop major as of August 2026. Keep this
-/// separate from app WebViews: mobile WebViews use their native user agent only
-/// for login, while server-side page discovery identifies as a desktop browser.
+/// Keep this separate from app WebViews: mobile WebViews use their native user
+/// agent only for login, while server-side provider discovery identifies as a
+/// current desktop browser without actually launching one.
 pub const PROVIDER_DESKTOP_WEB_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
 
