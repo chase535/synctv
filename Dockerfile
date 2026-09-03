@@ -115,30 +115,17 @@ LABEL org.opencontainers.image.title="SyncTV" \
     org.opencontainers.image.source="https://github.com/synctv-org/synctv" \
     org.opencontainers.image.licenses="MIT"
 
-# Chromium is only a short-lived authenticated bootstrap helper when the cheap
-# static provider path does not expose media. The Rust CDP path injects one
-# bounded page hook before navigation; no browser extension or playback engine
-# is kept alive.
+# Provider playback discovery is HTTP-only. Keep the runtime image small and do
+# not install a browser just to resolve provider metadata.
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    chromium \
     curl && rm -rf /var/lib/apt/lists/*
 
-COPY docker/synctv-chromium.sh /usr/local/bin/synctv-chromium
-RUN chmod 0755 /usr/local/bin/synctv-chromium
-
-# Keep Chromium discovery deterministic inside Docker and reduce allocator
-# growth on memory-constrained hosts. Two Tokio workers preserve timer/SQL/
-# WebSocket liveness if one worker is briefly delayed by kernel or filesystem
-# pressure on a single-core VPS; this does not create additional CPU capacity.
-# Do not force Chromium --single-process here: real low-memory traces showed
-# that sharing the browser/renderer process starves the official provider page
-# badly enough that even tiny Runtime.evaluate calls stop making progress.
-# Renderer count is still capped at one by the Rust launcher, so normal process
-# separation trades a modest amount of RAM for substantially better scheduling.
-ENV CHROMIUM_BIN=/usr/local/bin/synctv-chromium \
-    SYNCTV_CHROMIUM_SINGLE_PROCESS=false \
-    MALLOC_ARENA_MAX=2 \
+# Two Tokio workers preserve timer/SQL/WebSocket liveness on a single-core VPS
+# when one worker is briefly delayed by kernel or filesystem pressure. This does
+# not create additional CPU capacity. MALLOC_ARENA_MAX only constrains libc
+# consumers because the SyncTV binary itself uses mimalloc in this image.
+ENV MALLOC_ARENA_MAX=2 \
     TOKIO_WORKER_THREADS=2
 
 # Create synctv for running the application
@@ -158,8 +145,8 @@ COPY --from=builder /synctv /usr/local/bin/synctv
 # Switch to non-root user
 USER synctv
 
-# Verify PATH resolution and runtime dependencies using the production user.
-RUN command -v synctv && synctv --version && command -v chromium && command -v synctv-chromium
+# Verify PATH resolution and the only required runtime helper.
+RUN command -v synctv && synctv --version && command -v curl
 
 # Expose ports
 # 8080: HTTP API + public gRPC (also serves HLS via /api/room/movie/live/hls/*)
