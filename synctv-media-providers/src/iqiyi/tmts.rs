@@ -10,7 +10,8 @@ use crate::web_session::ScopedWebSessionClient;
 use crate::ProviderClientError;
 
 const RESOLVER_TIMEOUT: Duration = Duration::from_secs(8);
-const TMTS_ENDPOINT: &str = "https://cache.m.iqiyi.com/tmts";
+const TMTS_HTTPS_ENDPOINT: &str = "https://cache.m.iqiyi.com/jp/tmts";
+const TMTS_HTTP_ENDPOINT: &str = "http://cache.m.iqiyi.com/jp/tmts";
 const TMTS_KEY: &str = "d5fb4bd9d50c4be6948c97edd7254b0e";
 const TMTS_SRC: &str = "76f90cbd92f94a2e925d83e8ccd22cb7";
 const MAX_JSON_SCAN_NODES: usize = 2_048;
@@ -65,6 +66,15 @@ async fn discover_tmts_media_inner(
     let normalized = super::normalize_serialized_scan_text(html);
     let mut ids = extract_page_ids(&normalized)?;
 
+    if ids.tvid.is_none() {
+        if let Some(slug) = page_video_slug(page_url) {
+            if let Ok(Some(tvid)) = fetch_decoded_tvid(session, &slug).await {
+                ids.tvid = Some(tvid);
+                ids.tvid_source = "decode_api";
+            }
+        }
+    }
+
     let Some(tvid) = ids.tvid.clone() else {
         tracing::info!(
             target: "synctv_media_providers::iqiyi",
@@ -72,7 +82,7 @@ async fn discover_tmts_media_inner(
             page_host = page_url.host_str().unwrap_or(""),
             reason = "missing_tvid",
             elapsed_ms = started.elapsed().as_millis(),
-            "Skipping iQiyi TMTS discovery because no tvid was exposed by the page"
+            "Skipping iQiyi TMTS discovery because no tvid could be resolved"
         );
         return Ok(TmtsDiscovery::default());
     };
@@ -108,8 +118,23 @@ async fn discover_tmts_media_inner(
         "Querying iQiyi TMTS without launching a browser"
     );
 
-    let request_url = build_tmts_url(&tvid, vid)?;
-    let response = session.get_text(request_url.as_str()).await?;
+    let timestamp = unix_millis();
+    let https_url = build_tmts_url(TMTS_HTTPS_ENDPOINT, &tvid, vid, timestamp)?;
+    let (response, transport) = match session.get_text(https_url.as_str()).await {
+        Ok(response) => (response, "https"),
+        Err(_) => {
+            tracing::info!(
+                target: "synctv_media_providers::iqiyi",
+                stage = "tmts_http_transport_fallback",
+                page_host = page_url.host_str().unwrap_or(""),
+                reason = "https_request_failed",
+                "Retrying the same bounded TMTS metadata request over the legacy HTTP endpoint"
+            );
+            let http_url = build_tmts_url(TMTS_HTTP_ENDPOINT, &tvid, vid, timestamp)?;
+            (session.get_text(http_url.as_str()).await?, "http")
+        }
+    };
+
     let root = parse_tmts_response(&response)?;
     let response_code = root
         .get("code")
@@ -137,6 +162,7 @@ async fn discover_tmts_media_inner(
         elapsed_ms = started.elapsed().as_millis(),
         response_bytes = response.len(),
         response_code = %response_code,
+        transport,
         stream_count = media_urls.len(),
         highest_vd,
         drm_detected,
@@ -191,6 +217,29 @@ fn first_capture(text: &str, patterns: &[&str]) -> Result<Option<String>, Provid
     Ok(None)
 }
 
+fn page_video_slug(page_url: &Url) -> Option<String> {
+    let file_name = page_url.path_segments()?.next_back()?;
+    let slug = file_name.strip_prefix("v_")?.strip_suffix(".html")?;
+    (!slug.is_empty() && slug.chars().all(|ch| ch.is_ascii_alphanumeric()))
+        .then(|| slug.to_string())
+}
+
+async fn fetch_decoded_tvid(
+    session: &ScopedWebSessionClient,
+    slug: &str,
+) -> Result<Option<String>, ProviderClientError> {
+    let url = format!(
+        "https://pcw-api.iq.com/api/decode/{slug}?platformId=3&modeCode=intl&langCode=sg"
+    );
+    let response = session.get_text(&url).await?;
+    let root: Value = serde_json::from_str(&response)
+        .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
+    Ok(root
+        .get("data")
+        .and_then(value_as_string)
+        .filter(|value| value.len() >= 5 && value.chars().all(|ch| ch.is_ascii_digit())))
+}
+
 async fn fetch_baseinfo_vid(
     session: &ScopedWebSessionClient,
     tvid: &str,
@@ -235,16 +284,22 @@ fn looks_like_vid(value: &str) -> bool {
     (16..=64).contains(&value.len()) && value.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
-fn build_tmts_url(tvid: &str, vid: &str) -> Result<Url, ProviderClientError> {
-    let timestamp = unix_millis();
+fn build_tmts_url(
+    endpoint: &str,
+    tvid: &str,
+    vid: &str,
+    timestamp: u128,
+) -> Result<Url, ProviderClientError> {
     let timestamp_text = timestamp.to_string();
-    let sc = md5_hex(&format!("{timestamp}{TMTS_KEY}{vid}"));
-    let mut url = Url::parse(&format!("{TMTS_ENDPOINT}/{tvid}/{vid}/"))
+    let sc = md5_hex(&format!("{timestamp}{TMTS_KEY}{tvid}"));
+    let mut url = Url::parse(&format!("{endpoint}/{tvid}/{vid}/"))
         .map_err(|error| ProviderClientError::Parse(error.to_string()))?;
     url.query_pairs_mut()
-        .append_pair("t", &timestamp_text)
+        .append_pair("tvid", tvid)
+        .append_pair("vid", vid)
+        .append_pair("src", TMTS_SRC)
         .append_pair("sc", &sc)
-        .append_pair("src", TMTS_SRC);
+        .append_pair("t", &timestamp_text);
     Ok(url)
 }
 
@@ -299,12 +354,13 @@ fn extract_streams(root: &Value) -> Vec<TmtsStream> {
 
 fn quality_rank(vd: &str) -> u16 {
     match vd {
-        "10" | "19" => 600,
-        "5" | "18" | "600" => 500,
-        "4" | "17" | "500" => 400,
-        "2" | "14" | "21" | "75" | "300" => 300,
-        "1" | "200" => 200,
-        "96" | "100" => 100,
+        "18" => 7,
+        "5" => 6,
+        "4" | "17" => 5,
+        "21" => 4,
+        "2" => 3,
+        "1" => 2,
+        "96" => 1,
         _ => 0,
     }
 }
@@ -366,6 +422,12 @@ mod tests {
     }
 
     #[test]
+    fn extracts_short_video_slug_without_running_javascript() {
+        let page = Url::parse("https://www.iqiyi.com/v_19rrhnnclk.html").expect("url");
+        assert_eq!(page_video_slug(&page).as_deref(), Some("19rrhnnclk"));
+    }
+
+    #[test]
     fn parses_tmts_streams_in_known_quality_order() {
         let root = serde_json::json!({
             "code": "A00000",
@@ -384,10 +446,25 @@ mod tests {
     }
 
     #[test]
-    fn tmts_signature_matches_known_vector() {
+    fn tmts_request_matches_current_iqiyi_extractor_shape() {
+        let url = build_tmts_url(
+            TMTS_HTTPS_ENDPOINT,
+            "123456789",
+            "abcdef1234567890",
+            1_700_000_000_000,
+        )
+        .expect("tmts url");
+        assert_eq!(url.path(), "/jp/tmts/123456789/abcdef1234567890/");
+        let query = url.query_pairs().collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query.get("tvid").map(|value| value.as_ref()), Some("123456789"));
         assert_eq!(
-            md5_hex("1700000000000d5fb4bd9d50c4be6948c97edd7254b0eabcdef1234567890"),
-            "a3554d720be84c7952e46fe9be9c4992"
+            query.get("vid").map(|value| value.as_ref()),
+            Some("abcdef1234567890")
+        );
+        assert_eq!(query.get("t").map(|value| value.as_ref()), Some("1700000000000"));
+        assert_eq!(
+            query.get("sc").map(|value| value.as_ref()),
+            Some("40a701d8394f2ecf4cf38a8b9860ea86")
         );
     }
 }
