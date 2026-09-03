@@ -14,6 +14,7 @@ const DASH_ENDPOINT: &str = "https://cache.video.iqiyi.com/dash";
 const VF_SUFFIX: &str = "ulc2h7tka0mdrf2lkb1n6m6mulc2htbn";
 const DEFAULT_MANIFEST_BASE: &str = "https://cache-m.iq.com/dc/dt/";
 const MAX_JSON_SCAN_NODES: usize = 4_000;
+const MAX_MEDIA_CANDIDATES: usize = 24;
 
 #[derive(Debug, Default)]
 pub(super) struct DashDiscovery {
@@ -45,8 +46,8 @@ pub(super) async fn discover_dash_media(
         return Ok(DashDiscovery::default());
     };
 
-    let request_url = build_dash_url(tvid, ids.vid.as_deref().unwrap_or(""), session.cookies())?;
     let cookies = session.cookies();
+    let request_url = build_dash_url(tvid, ids.vid.as_deref().unwrap_or(""), cookies)?;
     let started = Instant::now();
     tracing::info!(
         target: "synctv_media_providers::iqiyi",
@@ -58,7 +59,7 @@ pub(super) async fn discover_dash_media(
         device_cookie_present = cookie_value(cookies, "QC005").is_some(),
         dfp_cookie_present = cookie_value(cookies, "__dfp").is_some(),
         strategy = "signed_http_dash",
-        "Querying iQiyi's lightweight dash metadata endpoint without a browser"
+        "Querying iQiyi dash metadata without launching a browser"
     );
 
     let response = session.get_text(request_url.as_str()).await?;
@@ -66,22 +67,17 @@ pub(super) async fn discover_dash_media(
     let mut discovery = extract_dash_discovery(&parsed);
     discovery.drm_detected |= response_has_drm_marker(&response);
 
-    let program_videos = parsed
+    let videos = parsed
         .pointer("/data/program/video")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or_default();
-    let highest_bid = parsed
-        .pointer("/data/program/video")
-        .and_then(Value::as_array)
+        .and_then(Value::as_array);
+    let program_video_count = videos.map(Vec::len).unwrap_or_default();
+    let highest_bid = videos
         .into_iter()
         .flatten()
         .filter_map(|video| value_as_u64(video.get("bid")))
         .max()
         .unwrap_or_default();
-    let inline_manifest_count = parsed
-        .pointer("/data/program/video")
-        .and_then(Value::as_array)
+    let inline_manifest_count = videos
         .into_iter()
         .flatten()
         .filter(|video| {
@@ -91,6 +87,7 @@ pub(super) async fn discover_dash_media(
                 .is_some_and(|value| value.contains("#EXTM3U"))
         })
         .count();
+    let response_code = parsed.get("code").and_then(value_as_i64).unwrap_or_default();
 
     tracing::info!(
         target: "synctv_media_providers::iqiyi",
@@ -98,7 +95,8 @@ pub(super) async fn discover_dash_media(
         page_host = page_url.host_str().unwrap_or(""),
         elapsed_ms = started.elapsed().as_millis(),
         response_bytes = response.len(),
-        program_video_count = program_videos,
+        response_code,
+        program_video_count,
         highest_bid,
         inline_manifest_count,
         candidate_count = discovery.media_urls.len(),
@@ -138,6 +136,7 @@ fn build_dash_url(
     cookies: &[SessionCookie],
 ) -> Result<Url, ProviderClientError> {
     let tm = unix_millis();
+    let tm_string = tm.to_string();
     let pck = cookie_value(cookies, "P00001").unwrap_or_default();
     let dfp = cookie_value(cookies, "__dfp")
         .and_then(|value| value.split('@').next())
@@ -149,6 +148,7 @@ fn build_dash_url(
     let uid = extract_uid(cookies).unwrap_or_default();
     let auth_key = iqiyi_auth_key(tm, tvid);
     let bop = json!({"version": "10.0", "dfp": dfp, "b_ft1": 28}).to_string();
+    let ut = if pck.is_empty() { "0" } else { "1" };
 
     let mut serializer = form_urlencoded::Serializer::new(String::new());
     for (key, value) in [
@@ -176,7 +176,7 @@ fn build_dash_url(
         ("k_err_retries", "0"),
         ("up", ""),
         ("qd_v", "a1"),
-        ("tm", tm.to_string().as_str()),
+        ("tm", tm_string.as_str()),
     ] {
         serializer.append_pair(key, value);
     }
@@ -193,7 +193,7 @@ fn build_dash_url(
         .append_pair("bop", &bop)
         .append_pair("sr", "1")
         .append_pair("ost", "0")
-        .append_pair("ut", "0");
+        .append_pair("ut", ut);
 
     let query = serializer.finish();
     let path_and_query = format!("/dash?{query}");
@@ -271,21 +271,50 @@ fn extract_dash_discovery(root: &Value) -> DashDiscovery {
         .and_then(Value::as_array)
         .map(|values| values.iter().collect::<Vec<_>>())
         .unwrap_or_default();
-    videos.sort_by_key(|video| std::cmp::Reverse(value_as_u64(video.get("bid")).unwrap_or_default()));
+    videos.sort_by_key(|video| {
+        std::cmp::Reverse(value_as_u64(video.get("bid")).unwrap_or_default())
+    });
 
     for video in videos {
-        for key in ["m3u8Url", "mpdUrl", "playUrl", "playbackUrl", "streamUrl", "videoUrl", "mediaUrl"] {
+        for key in [
+            "m3u8Url",
+            "mpdUrl",
+            "playUrl",
+            "playbackUrl",
+            "streamUrl",
+            "videoUrl",
+            "mediaUrl",
+        ] {
             if let Some(raw) = video.get(key).and_then(Value::as_str) {
-                push_resolved_url(raw, manifest_base.as_ref(), true, &mut seen, &mut media_urls);
+                push_resolved_url(
+                    raw,
+                    manifest_base.as_ref(),
+                    true,
+                    &mut seen,
+                    &mut media_urls,
+                );
             }
         }
         if let Some(manifest) = video.get("m3u8").and_then(Value::as_str) {
-            extract_inline_master_urls(manifest, manifest_base.as_ref(), &mut seen, &mut media_urls);
+            extract_inline_master_urls(
+                manifest,
+                manifest_base.as_ref(),
+                &mut seen,
+                &mut media_urls,
+            );
         }
     }
 
     let mut remaining = MAX_JSON_SCAN_NODES;
-    scan_json_for_media(root, "", 0, manifest_base.as_ref(), &mut remaining, &mut seen, &mut media_urls);
+    scan_json_for_media(
+        root,
+        "",
+        0,
+        manifest_base.as_ref(),
+        &mut remaining,
+        &mut seen,
+        &mut media_urls,
+    );
 
     DashDiscovery {
         media_urls,
@@ -302,10 +331,10 @@ fn scan_json_for_media(
     seen: &mut HashSet<String>,
     output: &mut Vec<String>,
 ) {
-    if *remaining == 0 || depth > 8 || output.len() >= 24 {
+    if *remaining == 0 || depth > 8 || output.len() >= MAX_MEDIA_CANDIDATES {
         return;
     }
-    *remaining = remaining.saturating_sub(1);
+    *remaining = (*remaining).saturating_sub(1);
     match value {
         Value::String(raw) => {
             let trusted_key = matches_media_key(key_hint);
@@ -314,7 +343,7 @@ fn scan_json_for_media(
         Value::Array(values) => {
             for child in values {
                 scan_json_for_media(child, key_hint, depth + 1, base, remaining, seen, output);
-                if *remaining == 0 || output.len() >= 24 {
+                if *remaining == 0 || output.len() >= MAX_MEDIA_CANDIDATES {
                     break;
                 }
             }
@@ -322,7 +351,7 @@ fn scan_json_for_media(
         Value::Object(values) => {
             for (key, child) in values {
                 scan_json_for_media(child, key, depth + 1, base, remaining, seen, output);
-                if *remaining == 0 || output.len() >= 24 {
+                if *remaining == 0 || output.len() >= MAX_MEDIA_CANDIDATES {
                     break;
                 }
             }
@@ -334,7 +363,13 @@ fn scan_json_for_media(
 fn matches_media_key(key: &str) -> bool {
     matches!(
         key.to_ascii_lowercase().as_str(),
-        "m3u8url" | "mpdurl" | "playurl" | "playbackurl" | "streamurl" | "videourl" | "mediaurl"
+        "m3u8url"
+            | "mpdurl"
+            | "playurl"
+            | "playbackurl"
+            | "streamurl"
+            | "videourl"
+            | "mediaurl"
     )
 }
 
@@ -349,13 +384,14 @@ fn push_resolved_url(
     if raw.is_empty() || raw.starts_with('#') || raw.contains('\n') || raw.len() > 8_192 {
         return;
     }
-    let looks_media = raw.to_ascii_lowercase().contains(".m3u8")
-        || raw.to_ascii_lowercase().contains(".mpd")
-        || raw.to_ascii_lowercase().contains(".mp4");
+    let lower = raw.to_ascii_lowercase();
+    let looks_media = lower.contains(".m3u8") || lower.contains(".mpd") || lower.contains(".mp4");
     if !trusted_key && !looks_media {
         return;
     }
-    let parsed = Url::parse(raw).ok().or_else(|| base.and_then(|base| base.join(raw).ok()));
+    let parsed = Url::parse(raw)
+        .ok()
+        .or_else(|| base.and_then(|base| base.join(raw).ok()));
     let Some(url) = parsed else {
         return;
     };
@@ -378,7 +414,11 @@ fn extract_inline_master_urls(
         return;
     }
     let is_master = manifest.contains("#EXT-X-STREAM-INF");
-    for line in manifest.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
+    for line in manifest
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
         let lower = line.to_ascii_lowercase();
         if is_master || lower.contains(".m3u8") || lower.contains(".mpd") {
             push_resolved_url(line, base, true, seen, output);
@@ -388,14 +428,29 @@ fn extract_inline_master_urls(
 
 fn response_has_drm_marker(response: &str) -> bool {
     let lower = response.to_ascii_lowercase();
-    ["widevine", "playready", "com.widevine.alpha", "license_url", "licenseurl", "drmlicense"]
-        .iter()
-        .any(|marker| lower.contains(marker))
+    [
+        "widevine",
+        "playready",
+        "com.widevine.alpha",
+        "license_url",
+        "licenseurl",
+        "drmlicense",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 fn value_as_u64(value: Option<&Value>) -> Option<u64> {
     match value? {
         Value::Number(number) => number.as_u64(),
+        Value::String(value) => value.parse().ok(),
+        _ => None,
+    }
+}
+
+fn value_as_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number.as_i64(),
         Value::String(value) => value.parse().ok(),
         _ => None,
     }
